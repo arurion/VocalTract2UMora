@@ -6,7 +6,7 @@
 | 出典 | ライセンス | 入手元 | 本リポジトリでの利用範囲 |
 |---|---|---|---|
 | VocalTractLab (VTL) | GPL-3.0 | https://www.vocaltractlab.de/ | 声道形状モデル・声帯モデル・音響シミュレーション等の移植／参照（未着手。流用時に具体的なファイルと範囲を追記） |
-| CHIMERA (chimera-vocal-synth) | MIT, Copyright (c) 2026 Jameson Hodge | https://github.com/jamesondh/chimera-vocal-synth | 参照／流用（未着手。流用時に追記） |
+| CHIMERA (chimera-vocal-synth) | MIT, Copyright (c) 2026 Jameson Hodge | https://github.com/jamesondh/chimera-vocal-synth | 調査済み・流用なし（現時点）。声門 `sources/glottis.rs` は LF ではなくパラメトリックな声門面積波形で、流量は気道ネットワーク（ベルヌーイ＋慣性）側で計算する設計。声道・音素計画・ジェスチャ（`airway/`, `phonetics/`, `control/`）は今後の流用候補。 |
 | coi-serviceworker v0.1.7 | MIT | https://github.com/gzuidhof/coi-serviceworker | `web/public/coi-serviceworker.js`（無改変で同梱） |
 
 ## MIT ライセンスの流用物について
