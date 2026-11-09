@@ -2,13 +2,58 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
     <title>VocalTract2UMora</title>
     <!-- Must load first: adds COOP/COEP via a service worker (GitHub Pages cannot set headers). -->
     <script src="./coi-serviceworker.js"></script>
   </head>
   <body>
-    <main id="app"></main>
+    <div class="app" id="app">
+      <aside class="sidebar glass" id="sidebar" aria-label="メニュー">
+        <div class="brand on-glass-text">VocalTract2UMora</div>
+        <nav class="nav" id="nav"></nav>
+        <div class="env on-glass-text" id="env"></div>
+      </aside>
+      <div class="scrim" id="scrim" hidden></div>
+
+      <header class="topbar glass">
+        <div class="titles on-glass-text">
+          <h1>声質エディタ</h1>
+          <p>声帯が作る音源(LF声門波)を整える</p>
+        </div>
+        <button class="btn" id="reset" type="button">初期値に戻す</button>
+        <button class="menu-btn" id="menu" type="button" aria-label="メニューを開く" aria-controls="sidebar" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+      </header>
+
+      <main class="content" id="content">
+        <section class="editor">
+          <div class="plots">
+            <div class="plot">
+              <div class="plot-head">
+                <h2>微分声門流 dUg/dt</h2>
+                <div class="readout"><span id="r-gain"></span><span id="r-times"></span></div>
+              </div>
+              <canvas id="wave" role="img" aria-label="微分声門流の1周期分の波形"></canvas>
+            </div>
+            <div class="plot">
+              <div class="plot-head">
+                <h2>スペクトル</h2>
+                <div class="readout"><span id="r-tilt"></span><span id="r-h1h2"></span></div>
+              </div>
+              <canvas id="spec" role="img" aria-label="音源スペクトルとスペクトル傾斜"></canvas>
+            </div>
+            <p class="notice" id="notice" hidden>
+              この Ra・Rk・Rg の組み合わせでは波形が閉じません。
+              <button class="link" id="fix" type="button">Rd に合わせる</button>
+            </p>
+          </div>
+          <div class="controls" id="controls"></div>
+        </section>
+      </main>
+    </div>
     <script type="module" src="./src/main.ts"></script>
   </body>
 </html>
