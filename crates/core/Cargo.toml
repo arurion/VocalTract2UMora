@@ -1,0 +1,9 @@
+[package]
+name = "vt2umora-core"
+description = "Articulatory synthesis core: LF glottal source, vocal tract, oto.ini generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Intentionally empty: keep the core dependency-free and portable.
