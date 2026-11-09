@@ -10,3 +10,7 @@ cd web
 npm install
 npm run dev
 ```
+
+## ライセンス
+
+GPL-3.0-or-later。外部コードの出典は [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) を参照。

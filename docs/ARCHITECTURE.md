@@ -79,7 +79,18 @@
 6. `feat/scrub-preview`: 矢状断面 + 3種グラフ
 7. `feat/batch-oto-zip`: バッチレンダラー、oto 自動生成、ZIP 出力
 
-## 7. 運用ルール
+## 7. ライセンスと由来
+
+- 本プロジェクトは **GPL-3.0-or-later**。VTL（GPLv3）の移植を許容し、CHIMERA（MIT）は著作権表示を保持して取り込む。
+- 由来の記録は `THIRD_PARTY_NOTICES.md` に集約する。流用したモジュールは次の表に追記すること。
+
+| モジュール | 由来 |
+|---|---|
+| `lf` | 自前実装（LF モデルは標準的な定義。VTL/CHIMERA は検証用に参照） |
+| `geometry`, `oto` | 自前実装 |
+| `tract`, `consonant`, `batch`（計画） | 未定（VTL / CHIMERA 流用の可能性あり） |
+
+## 8. 運用ルール
 
 - `main` へ直接 push しない。`chore/` `feat/` ブランチ + PR。
 - 依存は最小限（現状: web は `vite`, `typescript` のみ／core は依存ゼロ）。
