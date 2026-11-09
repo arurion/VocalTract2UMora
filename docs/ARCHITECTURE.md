@@ -59,8 +59,12 @@
 ## 4. 配布・ランタイム
 
 - **coi-serviceworker**: `web/public/` に置くことで `dist/` ルートへ出力。`index.html` の `<head>` 先頭で読み込む。初回ロード時に自動リロードして COOP/COEP を有効化。localhost では Vite の `server.headers` でも同等のヘッダを付与。
-- **Wasm マルチスレッド**: 最初は単一スレッドで雛形を成立させる。並列化は後続PRで、nightly + `-C target-feature=+atomics,+bulk-memory,+mutable-globals` + `-Z build-std` と `wasm-bindgen-rayon` 系の導入を評価（依存の重さと得られる速度を比較して判断）。バッチは当面「worker 複数 × 1エントリ/ジョブ」で並列化可能。
-- **AudioWorklet**: Wasm を SharedArrayBuffer のリングバッファ経由で供給するか、worklet 内でインスタンス化する。
+- **互換性ポリシー（重要）**: 対象は「可能な限り全てのブラウザ」。`SharedArrayBuffer` / Wasm マルチスレッドは**任意の高速化**であり、必須にしない。Android WebView 系ブラウザ（Via 等）では service worker が有効でも `crossOriginIsolated` が false のままになることを実機で確認済み。
+  - 動作モード: `threaded`（isolated かつ SAB 利用可）/ `basic`（それ以外）。`web/src/capabilities.ts` で起動時に検出し、UI に表示する。
+  - `basic` を基準実装とする: 単一スレッド Wasm を Web Worker で実行、バッチは「Worker 複数 × 1エントリ/ジョブ」で並列化（SAB 不要）。
+  - AudioWorklet への供給: `threaded` では共有リングバッファ、`basic` では `postMessage` 転送（Transferable）。AudioWorklet 非対応環境では、生成済みバッファを `AudioBufferSourceNode` で再生。
+  - Wasm スレッド（nightly + atomics + build-std）は `threaded` 限定の最適化として後続PRで評価。ビルドは別バイナリにせず、まず basic のみで機能を完成させる。
+- **AudioWorklet**: 上記のとおり。
 
 ## 5. ビルド / デプロイ
 
