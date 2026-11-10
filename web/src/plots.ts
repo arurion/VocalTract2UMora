@@ -134,3 +134,46 @@ function niceTicks(lo: number, hi: number, count: number): number[] {
   return out;
 }
 const fmtTick = (v: number) => (Math.abs(v) >= 10 ? v.toFixed(0) : Math.abs(v) >= 1 ? v.toFixed(1) : v.toFixed(2));
+
+export interface TractData { lengthCm: number; oralRatio: number; nasalScale: number }
+
+/** Schematic (to scale in length) of the vocal tract: pharynx, oral cavity, nasal branch. */
+export function drawTract(c: HTMLCanvasElement, d: TractData): void {
+  const ctx = fitCanvas(c);
+  const col = colors();
+  const W = c.clientWidth, H = c.clientHeight;
+  ctx.clearRect(0, 0, W, H);
+  const pad = 36, maxCm = 22;
+  const pxCm = (W - pad * 2) / maxCm;
+  const x0 = pad, xE = x0 + d.lengthCm * pxCm;
+  const xV = x0 + d.lengthCm * (1 - d.oralRatio) * pxCm; // pharynx | oral boundary (velum)
+  const cy = H * 0.6, hPh = 28, hOr = 38;
+
+  // nasal branch above the oral cavity, height follows the volume scale
+  const nh = Math.min(70, 12 * d.nasalScale);
+  ctx.fillStyle = col.soft; ctx.strokeStyle = col.line; ctx.lineWidth = 1.75; ctx.lineJoin = "round";
+  ctx.globalAlpha = 0.55;
+  ctx.beginPath(); ctx.rect(xV, cy - hOr / 2 - 8 - nh, xE - xV, nh); ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+
+  // main tube: pharynx (narrower) then oral cavity
+  ctx.beginPath();
+  ctx.moveTo(x0, cy - hPh / 2); ctx.lineTo(xV, cy - hPh / 2); ctx.lineTo(xV, cy - hOr / 2); ctx.lineTo(xE, cy - hOr / 2);
+  ctx.lineTo(xE, cy + hOr / 2); ctx.lineTo(xV, cy + hOr / 2); ctx.lineTo(xV, cy + hPh / 2); ctx.lineTo(x0, cy + hPh / 2); ctx.closePath();
+  ctx.globalAlpha = 0.35; ctx.fill(); ctx.globalAlpha = 1; ctx.stroke();
+
+  ctx.font = FONT; ctx.fillStyle = col.axis; ctx.strokeStyle = col.axis; ctx.lineWidth = 1;
+  ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+  ctx.fillText("声門", x0, cy + hOr / 2 + 18);
+  ctx.fillText("唇", xE, cy + hOr / 2 + 18);
+  ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.moveTo(xV, cy - hOr / 2 - 6); ctx.lineTo(xV, cy + hOr / 2 + 6); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = col.text;
+  ctx.fillText(`咽頭 ${(d.lengthCm * (1 - d.oralRatio)).toFixed(1)} cm`, (x0 + xV) / 2, cy + hOr / 2 + 36);
+  ctx.fillText(`口腔 ${(d.lengthCm * d.oralRatio).toFixed(1)} cm`, (xV + xE) / 2, cy + hOr / 2 + 36);
+  ctx.fillStyle = col.axis;
+  ctx.fillText(`鼻腔 ×${d.nasalScale.toFixed(2)}`, (xV + xE) / 2, cy - hOr / 2 - 8 - nh - 6);
+
+  // 5 cm scale bar
+  const sy = H - 10;
+  ctx.beginPath(); ctx.moveTo(x0, sy); ctx.lineTo(x0 + 5 * pxCm, sy); ctx.moveTo(x0, sy - 4); ctx.lineTo(x0, sy + 4); ctx.moveTo(x0 + 5 * pxCm, sy - 4); ctx.lineTo(x0 + 5 * pxCm, sy + 4); ctx.stroke();
+  ctx.textAlign = "left"; ctx.fillText("5 cm", x0 + 5 * pxCm + 8, sy + 4);
+}

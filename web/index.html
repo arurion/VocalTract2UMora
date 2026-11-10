@@ -19,8 +19,8 @@
 
       <header class="topbar glass">
         <div class="titles on-glass-text">
-          <h1>声質エディタ</h1>
-          <p>声帯が作る音源(LF声門波)を整える</p>
+          <h1 id="title">声質エディタ</h1>
+          <p id="subtitle">声帯が作る音源(LF声門波)を整える</p>
         </div>
         <button class="btn" id="reset" type="button">初期値に戻す</button>
         <button class="menu-btn" id="menu" type="button" aria-label="メニューを開く" aria-controls="sidebar" aria-expanded="false">
@@ -29,7 +29,7 @@
       </header>
 
       <main class="content" id="content">
-        <section class="editor">
+        <section class="editor" id="view-voice">
           <div class="plots">
             <div class="plot">
               <div class="plot-head">
@@ -51,6 +51,20 @@
             </p>
           </div>
           <div class="controls" id="controls"></div>
+        </section>
+
+        <section class="editor" id="view-geometry" hidden>
+          <div class="plots">
+            <div class="plot">
+              <div class="plot-head">
+                <h2>声道の構成</h2>
+                <div class="readout"><span id="g-lens"></span></div>
+              </div>
+              <canvas id="tract" role="img" aria-label="咽頭・口腔・鼻腔の長さと大きさを示す模式図"></canvas>
+              <div class="readout under"><span id="g-formants"></span></div>
+            </div>
+          </div>
+          <div class="controls" id="g-controls"></div>
         </section>
       </main>
     </div>
