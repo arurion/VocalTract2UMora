@@ -1,7 +1,7 @@
 # VocalTractLab (VTL) 調査メモ
 
 対象: https://github.com/TUD-STKS/VocalTractLabBackend-dev （C++、GPL-3.0、本プロジェクトと互換）。
-**読んだ範囲**: `LfPulse.cpp`、`Glottis.h`、`GeometricGlottis.h`、`Tube.h`、`TdsModel.h`、`Synthesizer.h`、`Speaker.h`（いずれも全体または公開インターフェース）。
+**読んだ範囲**: `LfPulse.cpp`、`Glottis.h`、`GeometricGlottis.h`、`Tube.h`、`TdsModel.h`、`Synthesizer.h`、`Speaker.h`、`VocalTract.h`（いずれも全体または公開インターフェース）。
 **未読**: `VocalTract.cpp`(250 KB)、`TdsModel.cpp`(83 KB)、`GesturalScore.cpp`(130 KB)、`TwoMassModel.cpp`、`TriangularGlottis.cpp`、`AnatomyParams.cpp`、`Surface/Geometry/Splines`。移植に着手する前に該当部分を読むこと。
 
 ## 1. 合成パイプライン
@@ -33,3 +33,24 @@ GesturalScore ─▶ VocalTract パラメータ ─▶ Tube(断面列) ┐
 3. **子音プレビューの要件**(舌と口蓋の接触判定、最小断面積)には、面積関数だけでなく矢状断面の輪郭が必要。VTL は調音パラメータ(顎・舌・唇・軟口蓋など約 20 個)から輪郭と面積関数を作る。**面積関数レベルのターゲットだけで進めるか、調音パラメータモデルまで移植するかは、設計上の大きな分岐**であり、`feat/consonant-editor` の前に決める。
 4. **話者データ**: VTL は `.speaker` ファイル(解剖データ)を使う。コードとは別に、データの再利用条件を確認してから取り込むこと。
 5. **計算量**: VTL は 44.1 kHz のサンプル毎に枝電流の連立方程式を解く。Wasm 単一スレッドで、Android 端末でも非リアルタイムのバッチ生成が現実的な速度で回るかを、tract-sim の早い段階で計測する。
+
+## 4. 決定: 調音パラメータモデルまで移植する (案B)
+
+オーナーの目標(舌と口蓋の接触ハイライト、3 点コーナー母音補間、無声子音のスクラブデバッグ)に近づくため、面積関数だけの簡易版ではなく VTL 型の調音モデルを移植する。
+
+### VocalTract の構造 (`VocalTract.h` より)
+- **調音パラメータ 19 個**: `HX HY`(舌骨) `JX JA`(顎) `LP LD`(唇) `VS VO`(軟口蓋) `TCX TCY`(舌体) `TTX TTY`(舌尖) `TBX TBY`(舌背) `TRX TRY`(舌根) `TS1 TS2 TS3`(舌の側面)。各パラメータは `x`(指定値)と `limitedX`(生体力学的制約後)、`min/max/neutral` を持つ。
+- **Shape = 名前 + 19 個のパラメータ値**。これが「基準声道形状」の表現に使える。/aka/ /iki/ /uku/ の 3 形状と、その重心補間・口蓋化の手動上書きは、19 次元ベクトルの補間と上書きとして素直に実装できる。
+- **3D 表面モデル**: 上顎(口蓋・歯・カバー)、下顎、唇、舌(動的 33 + 静的 4 リブ × 11 点)、軟口蓋、口蓋垂、喉頭蓋、咽頭、放射面などを「リブ」の列で持つ。
+- **断面の計算**: 中心線(129 点)に沿って横方向 96 サンプルの断面プロファイルを取り、面積関数(咽頭 16 + 口腔 24 区間)を得る。
+- **Anatomy**: 話者固有で調音と独立な形状(口蓋の点列・角度、顎の支点、歯、舌の半径、唇幅、軟口蓋の形状、咽頭・喉頭・喉頭蓋の寸法、梨状窩、気管下腔長、鼻腔長、パラメータごとの速度係数など)。`.speaker`(XML)から読み込む。
+
+### 話者データ
+`resources/JD3.speaker`(約 91 KB)が同梱されている。VTL リポジトリは GPL-3.0 だが、データ自体の利用条件は作者(Peter Birkholz, vocaltractlab.de)側の条件も含めて**移植時に確認する**。確認できるまでは同梱せず、読み込み機能(ユーザーが自分のファイルを開く形)から始める。
+
+### 改訂したロードマップ
+1. `feat/tract-sim`: Tube(区間列)と TDS ソルバー(Rust)、LF 流量源で駆動、一様管での検証、Wasm での速度計測
+2. `feat/vocal-tract-model`: `.speaker` XML の読み込み → 調音パラメータ → 輪郭・面積関数。矢状断面の描画、舌口蓋の接触判定
+3. `feat/consonant-editor`: Shape(19 次元)の 3 点補間と口蓋化の上書き
+4. `feat/scrub-preview`: 時間軸のスクラブ、最小断面積・声門開口度・接触ハイライト
+5. `feat/batch-oto-zip`: バッチ生成と oto.ini の自動算出、ZIP 出力

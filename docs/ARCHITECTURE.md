@@ -75,13 +75,14 @@
 
 ## 6. ロードマップ（PR 単位）
 
-1. `chore/architecture`（本PR）: 雛形・CI
-2. `feat/lf-source`: LF波形生成 + dUg/dt・Spectral Tilt プレビュー（声質エディタ）
-3. `feat/geometry-editor`: 骨格エディタ + JSON I/O
-4. `feat/tract-sim`: 声道管モデル、声帯自励振動、流体（気流）計算
-5. `feat/consonant-editor`: 3点補間と口蓋化オーバーライド
-6. `feat/scrub-preview`: 矢状断面 + 3種グラフ
-7. `feat/batch-oto-zip`: バッチレンダラー、oto 自動生成、ZIP 出力
+完了: 雛形・CI、ライセンス(GPL-3.0)、互換性ポリシー、LF 声質エディタ、骨格エディタ、VTL 調査。
+決定事項と根拠は `docs/VTL_NOTES.md` を参照（VTL 型の調音パラメータモデルまで移植する）。
+
+1. `feat/tract-sim`: Tube（区間列）+ TDS ソルバー、LF 流量源で駆動、一様管での検証、Wasm 速度計測
+2. `feat/vocal-tract-model`: `.speaker` 読み込み、19 個の調音パラメータ → 矢状断面の輪郭 → 面積関数、舌口蓋の接触判定
+3. `feat/consonant-editor`: 基準形状（19 次元）の 3 点補間と口蓋化の手動上書き
+4. `feat/scrub-preview`: スクラブ、最小断面積・声門開口度・接触ハイライト
+5. `feat/batch-oto-zip`: バッチレンダラー、oto 自動算出、ZIP 出力
 
 ## 7. ライセンスと由来
 
