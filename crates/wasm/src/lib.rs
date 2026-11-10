@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use vt2umora_core::geometry::SpeakerGeometry;
 use vt2umora_core::lf::{self, LfError, LfShape, VoiceParams};
 use wasm_bindgen::prelude::*;
 
@@ -76,4 +77,22 @@ pub fn lf_preview(
     lf::preview(&params, sample_rate, wave_points as usize)
         .map(|inner| LfPreview { inner })
         .map_err(err)
+}
+
+/// Clamps a speaker geometry and derives lengths and neutral-tract formants.
+/// Returns `[tract_length_cm, oral_ratio, nasal_volume_scale, oral_cm, pharyngeal_cm, f1, f2, f3]`.
+#[wasm_bindgen]
+pub fn geometry_info(tract_length_cm: f64, oral_ratio: f64, nasal_volume_scale: f64) -> Vec<f64> {
+    let g = SpeakerGeometry { tract_length_cm, oral_ratio, nasal_volume_scale }.clamped();
+    let f = g.neutral_formants(3);
+    vec![
+        g.tract_length_cm,
+        g.oral_ratio,
+        g.nasal_volume_scale,
+        g.oral_length_cm(),
+        g.pharyngeal_length_cm(),
+        f[0],
+        f[1],
+        f[2],
+    ]
 }
