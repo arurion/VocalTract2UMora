@@ -320,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn agrees_with_vocaltractlab_reference_values() {
+        // Reference (epsilon, alpha) computed from the equations used by VocalTractLab's LfPulse
+        // (OQ/SQ/TL parameterisation: Te = OQ, Tp = Te*SQ/(1+SQ), Ta = TL; T0 = 1).
+        // Only the numbers are used here; no VTL code is included.
+        // (OQ, SQ, TL) -> (Rg, Rk, Ra) = (1/(2Tp), (Te-Tp)/Tp, TL)
+        let cases = [
+            (1.333333333, 0.333333333, 0.02, 50.000000, 4.236976),
+            (1.25, 0.5, 0.04, 24.998864, 1.229362),
+            (1.190476190, 0.666666667, 0.08, 12.176021, 0.024308),
+        ];
+        for (rg, rk, ra, eps, alpha) in cases {
+            let p = LfPulse::solve(LfShape { ra, rk, rg }).unwrap();
+            assert!((p.epsilon - eps).abs() / eps < 1e-3, "epsilon {} vs {}", p.epsilon, eps);
+            assert!((p.alpha - alpha).abs() < 2e-3, "alpha {} vs {}", p.alpha, alpha);
+        }
+    }
+
+    #[test]
     fn rejects_impossible_timing() {
         // Ta larger than the remaining closing time.
         assert_eq!(LfPulse::solve(LfShape { ra: 0.6, rk: 0.3, rg: 1.0 }), Err(LfError::NoSolution));
