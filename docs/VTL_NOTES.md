@@ -46,7 +46,7 @@ GesturalScore ─▶ VocalTract パラメータ ─▶ Tube(断面列) ┐
 - **Anatomy**: 話者固有で調音と独立な形状(口蓋の点列・角度、顎の支点、歯、舌の半径、唇幅、軟口蓋の形状、咽頭・喉頭・喉頭蓋の寸法、梨状窩、気管下腔長、鼻腔長、パラメータごとの速度係数など)。`.speaker`(XML)から読み込む。
 
 ### 話者データ
-`resources/JD3.speaker`(約 91 KB)が同梱されている。VTL リポジトリは GPL-3.0 だが、データ自体の利用条件は作者(Peter Birkholz, vocaltractlab.de)側の条件も含めて**移植時に確認する**。確認できるまでは同梱せず、読み込み機能(ユーザーが自分のファイルを開く形)から始める。
+`resources/JD3.speaker`(約 91 KB)が同梱されている。VTL リポジトリは GPL-3.0 で、README にデータ用の別段のライセンス記述は無い。**GPL-3.0 のリポジトリの一部として配布されているため、GPL-3.0 として扱い、本リポジトリの `resources/JD3.speaker` に無改変で同梱した**(`THIRD_PARTY_NOTICES.md` に記録)。作者側から別の条件が示された場合は同梱をやめ、ユーザーが自分のファイルを開く方式に切り替える。
 
 ### 改訂したロードマップ
 1. `feat/tract-sim`: Tube(区間列)と TDS ソルバー(Rust)、LF 流量源で駆動、一様管での検証、Wasm での速度計測
@@ -90,3 +90,12 @@ GesturalScore ─▶ VocalTract パラメータ ─▶ Tube(断面列) ┐
 - **`synth.rs`**: VTL の `Synthesizer::add` と同じサンプル毎の順序(声門形状 → 管 → 4 点の圧力 → 声帯の時間発展 → TDS → 流量の時間微分 → 出力フィルタ、スケール 1e-7)。
 - **検証**: 声門面積が F0 通りに開閉(1 秒で 98〜102 周期)、合成音の F0 が指定値の ±4 Hz 以内で周期性が高いこと、F0 を 180 Hz にすると追従すること、肺圧 0 で無音、肺圧が低いと小さいこと。合成した母音のスペクトルは調波の櫛に一様管の共鳴(500/1500/2500 Hz 付近)が重なる。
 - **意味**: oto.ini に必要な「声帯振動の開始」は、肺圧と声門パラメータの時系列から声門面積・流量の周期性として検出できる。次は鼻腔、続いて調音パラメータモデル。
+
+## 8. 進捗: 話者ファイルの読み込み (`xml.rs`, `speaker.rs`, `resources/JD3.speaker`)
+
+- **`.speaker` の内容**: 解剖データ(口蓋・顎・舌・唇・軟口蓋・咽頭・喉頭・梨状窩・声門下・鼻腔の寸法)、19 個の調音パラメータの定義(名前・範囲・中立値・速度係数)、声道形状 69 個、声帯(Geometric glottis)の形状。
+- **重要な発見**: 子音の基準形状が、**3 つのコーナー母音 /a/ /i/ /u/ の文脈ごとに定義されている**。例: `tt-alveolar-closure(a)` / `(i)` / `(u)`、`tb-velar-closure(…)`、`ll-labial-closure(…)`、`tt-alveolar-fricative(…)`、`tt-postalveolar-fricative(…)`、`tb-palatal-fricative(…)`、`tt-dental-fricative(…)`、`tb-uvular-fricative(…)`、`tt-*-lateral(…)`。VTL 方式の「3 点コーナー母音補間」は、この 3 形状(19 次元ベクトル)を後続母音の位置(母音三角形の重心座標)で補間するもの。検証として、`tb-velar-closure` の舌体位置が /a/ と /i/ の文脈で大きく異なる(/i/ の前で前進する)ことをテストしている。
+- **声帯形状**: modal / breathy / pressed / whisper / voiceless-plosive / voiceless-fricative / voiced-plosive / voiced-fricative / h など。無声子音では声門を大きく開く(XB が modal より約 0.05 cm 以上大きい)ことをテストで確認。
+- **日本語への当てはめ(案)**: か行 → `tb-velar-closure`、さ行 → `tt-alveolar-fricative`、し・ちゃ行 → `tt-postalveolar-*`、ひ → `tb-palatal-fricative`、ぱ・ば・ま行 → `ll-labial-closure`、た・だ・な行 → `tt-alveolar-closure`、ら行 → 短い `tt-alveolar-closure`(はじき音)、ふ → 両唇の狭め。母音は a e i o u の形状(ドイツ語話者のデータなので日本語の母音に合わせた調整が必要になる可能性がある)。日本語向けの口蓋化(き・け、拗音)は、この補間の結果を手動で上書きする設計。
+- **実装**: 依存ゼロの最小 XML パーサーと、読み込み・検証つきのローダー。パラメータの名前・順序は VTL と一致していることを検証し、壊れたファイルは明確なエラーで拒否する。
+- **次**: 調音パラメータ → 3D 表面 → 中心線 → 断面 → 面積関数(`calcSurfaces`、`calcTongue`、`calcLips`、`calcCenterLine`、`getCrossProfiles` ほか約 5,000 行)。
