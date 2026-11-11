@@ -9,7 +9,10 @@
 
 pub mod fft;
 pub mod geometry;
+pub mod glottis;
+pub mod iir;
 pub mod lf;
 pub mod oto;
+pub mod synth;
 pub mod tds;
 pub mod tube;

@@ -253,6 +253,18 @@ impl Tds {
         self.lips_dipole = NoiseSource::default();
     }
 
+    /// Updates only the two glottal sections (called every sample by the synthesizer).
+    pub fn set_glottis(&mut self, length_cm: [f64; 2], area_cm2: [f64; 2]) {
+        for (k, i) in [LOWER_GLOTTIS, UPPER_GLOTTIS].into_iter().enumerate() {
+            let s = &mut self.sec[i];
+            s.length = length_cm[k];
+            s.area = area_cm2[k].max(MIN_AREA_CM2);
+            s.volume = s.area * s.length;
+        }
+    }
+
+    pub fn set_aspiration_db(&mut self, db: f64) { self.aspiration_db = db; }
+
     /// Seeds the noise generator (renders are reproducible for a given seed).
     pub fn set_noise_seed(&mut self, seed: u64) {
         self.rng = seed | 1;

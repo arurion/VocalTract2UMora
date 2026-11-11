@@ -102,6 +102,14 @@ impl Tube {
         }
     }
 
+    /// Sets the lengths and areas of the two glottal sections (from the glottis model).
+    pub fn set_glottis_geometry(&mut self, length_cm: [f64; 2], area_cm2: [f64; 2]) {
+        for (k, i) in [LOWER_GLOTTIS, UPPER_GLOTTIS].into_iter().enumerate() {
+            self.sections[i].length_cm = length_cm[k];
+            self.sections[i].area_cm2 = area_cm2[k].max(MIN_AREA_CM2);
+        }
+    }
+
     /// Sets the 40 supraglottal sections (pharynx then mouth).
     pub fn set_supraglottal(&mut self, length_cm: &[f64], area_cm2: &[f64]) {
         assert_eq!(length_cm.len(), NUM_SUPRAGLOTTAL);
