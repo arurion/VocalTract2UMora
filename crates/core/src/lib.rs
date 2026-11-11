@@ -13,6 +13,8 @@ pub mod glottis;
 pub mod iir;
 pub mod lf;
 pub mod oto;
+pub mod speaker;
 pub mod synth;
 pub mod tds;
 pub mod tube;
+pub mod xml;
