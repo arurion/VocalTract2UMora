@@ -7,8 +7,9 @@
 //! sparse Cholesky factorisation. This is a port of the formulation used by VocalTractLab's
 //! `TdsModel` (Birkholz et al.): VocalTractLab, (C) Peter Birkholz, GPL-3.0-or-later.
 //!
-//! Subset implemented here: oral chain with lip radiation. Not yet: nasal cavity, sinuses,
-//! piriform fossa, noise sources, radiation from the skin, transvelar coupling.
+//! Subset implemented here: oral chain with lip radiation and turbulence noise sources
+//! (aspiration, fricatives, bursts). Not yet: nasal cavity, sinuses, piriform fossa, radiation
+//! from the skin, transvelar coupling.
 
 use crate::tube::*;
 use std::f64::consts::PI;
@@ -20,6 +21,107 @@ pub const AIR_VISCOSITY: f64 = 1.86e-4; // dyne s/cm^2
 const THETA: f64 = 0.505;
 const THETA1: f64 = 1.0 - THETA;
 const MIN_RADIUS_CM: f64 = 0.6;
+/// Cutoff of the low-pass filter for the flow that drives friction noise.
+const NOISE_CUTOFF_FREQ: f64 = 500.0;
+const NOISE_BUF: usize = 8;
+
+/// One lumped noise source: a pressure source with a spectrally shaped random signal.
+#[derive(Clone, Default)]
+struct NoiseSource {
+    first_order: bool,
+    cutoff: f64,
+    target_amp: f64,
+    current_amp: f64,
+    in_buf: [f64; NOISE_BUF],
+    out_buf: [f64; NOISE_BUF],
+    sample: f64,
+}
+
+#[derive(Clone, Copy)]
+struct Cons {
+    first: usize,
+    last: usize,
+    narrowest: usize,
+    obstacle_pos: f64,
+    area: f64,
+    flow: f64,
+    velocity: f64,
+    cutoff: f64,
+    gain: f64,
+    full_amp: f64,
+    articulator: Articulator,
+}
+
+impl Cons {
+    fn new(articulator: Articulator) -> Cons {
+        Cons { first: 0, last: 0, narrowest: 0, obstacle_pos: 0.0, area: 0.0, flow: 0.0, velocity: 0.0, cutoff: 0.0, gain: 0.0, full_amp: 0.0, articulator }
+    }
+}
+
+fn next_uniform(rng: &mut u64) -> f64 {
+    *rng ^= *rng << 13;
+    *rng ^= *rng >> 7;
+    *rng ^= *rng << 17;
+    ((*rng >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+}
+
+/// Gaussian noise with standard deviation 1/sqrt(12), limited to [-1, 1] (as in VTL).
+fn next_noise(rng: &mut u64) -> f64 {
+    loop {
+        let (u1, u2) = (next_uniform(rng), next_uniform(rng));
+        let z = (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos();
+        let x = z / 12f64.sqrt();
+        if (-1.0..=1.0).contains(&x) { return x; }
+    }
+}
+
+/// Advances one noise source by one sample.
+fn noise_sample(s: &mut NoiseSource, threshold: f64, position: u64, dt: f64, rng: &mut u64) {
+    if s.target_amp > s.current_amp {
+        // Rises slowly (3 ms time constant on sqrt(amp)), falls instantly: avoids frication
+        // noise just before the implosion of plosives.
+        let f = (-1.0 / (0.003 / dt)).exp();
+        let (st, sc) = (s.target_amp.sqrt(), s.current_amp.sqrt());
+        let sc = (1.0 - f) * st + f * sc;
+        s.current_amp = sc * sc;
+    } else {
+        s.current_amp = s.target_amp;
+    }
+    if s.current_amp < threshold {
+        // Gate the output only. VTL also resets `current_amp` to 0 here, which keeps weak
+        // sources (target below ~18 at 44.1 kHz) from ever starting, because the first step of
+        // the smoothed rise is already below the threshold. We let the rise continue instead.
+        s.in_buf = [0.0; NOISE_BUF];
+        s.out_buf = [0.0; NOISE_BUF];
+        s.sample = 0.0;
+        return;
+    }
+    let ratio = s.cutoff.max(1.0) * dt;
+    let (a, b, order) = if s.first_order {
+        let x = (-2.0 * PI * ratio).exp();
+        ([1.0 - x, 0.0, 0.0], [0.0, x, 0.0], 1)
+    } else {
+        // Critically damped second-order low-pass (Q = 1/sqrt(2)).
+        let q = 1.0 / 2f64.sqrt();
+        let k = (PI * ratio).tan();
+        let den = k * k + k / q + 1.0;
+        let a0 = k * k / den;
+        ([a0, 2.0 * a0, a0], [1.0, -2.0 * (k * k - 1.0) / den, -(k * k - k / q + 1.0) / den], 2)
+    };
+    // Constant gain-bandwidth product: louder for low cutoffs, quieter for high ones.
+    let factor = 1000.0 / s.cutoff.max(1.0);
+    let gain = s.current_amp * factor * factor.sqrt();
+    let x = next_noise(rng);
+    let idx = (position as usize) & (NOISE_BUF - 1);
+    s.in_buf[idx] = x;
+    let mut sum = a[0] * x;
+    for k in 1..=order {
+        let j = (position as usize).wrapping_sub(k) & (NOISE_BUF - 1);
+        sum += a[k] * s.in_buf[j] + b[k] * s.out_buf[j];
+    }
+    s.out_buf[idx] = sum;
+    s.sample = sum * gain;
+}
 
 #[derive(Clone, Default)]
 struct Sec {
@@ -32,6 +134,9 @@ struct Sec {
     d: f64, e: f64,
     cur_in: Option<usize>,
     cur_out: [Option<usize>; 2],
+    pos: f64,
+    articulator: Articulator,
+    dipole: NoiseSource,
 }
 
 #[derive(Clone, Default)]
@@ -40,6 +145,8 @@ struct Cur {
     target: Option<usize>,
     mag: f64,
     rate: f64,
+    /// The flow low-pass filtered at 500 Hz; drives the noise sources.
+    noise_mag: f64,
 }
 
 pub struct Tds {
@@ -57,6 +164,14 @@ pub struct Tds {
     flow_source_section: Option<usize>,
     pressure_source_amp: f64,
     pressure_source_section: Option<usize>,
+    /// Generate turbulence noise sources (default on).
+    pub generate_noise: bool,
+    lips_dipole: NoiseSource,
+    teeth_position: f64,
+    aspiration_db: f64,
+    tongue_tip_elevation: f64,
+    position: u64,
+    rng: u64,
 }
 
 const N: usize = NUM_SECTIONS + 2; // one inflow current per section + two radiation currents
@@ -102,6 +217,9 @@ impl Tds {
             row_lists, col_lists,
             flow_source_amp: 0.0, flow_source_section: None,
             pressure_source_amp: 0.0, pressure_source_section: None,
+            generate_noise: true, lips_dipole: NoiseSource::default(),
+            teeth_position: 15.0, aspiration_db: -40.0, tongue_tip_elevation: 0.0,
+            position: 0, rng: 0x9E37_79B9_7F4A_7C15,
         };
         t.set_tube(tube);
         t
@@ -109,7 +227,13 @@ impl Tds {
 
     /// Copies the geometry and wall properties of the tube into the simulation state.
     pub fn set_tube(&mut self, tube: &Tube) {
-        for (s, t) in self.sec.iter_mut().zip(&tube.sections) {
+        let pos = tube.positions();
+        self.teeth_position = tube.teeth_position_cm;
+        self.aspiration_db = tube.aspiration_strength_db;
+        self.tongue_tip_elevation = tube.tongue_tip_side_elevation;
+        for (i, (s, t)) in self.sec.iter_mut().zip(&tube.sections).enumerate() {
+            s.pos = pos[i];
+            s.articulator = t.articulator;
             s.area = t.area_cm2.max(MIN_AREA_CM2);
             s.length = t.length_cm;
             s.volume = s.area * s.length;
@@ -124,7 +248,14 @@ impl Tds {
             s.pressure = 0.0; s.pressure_rate = 0.0;
             s.wall_current = 0.0; s.wall_current_rate = 0.0; s.wall_current_rate2 = 0.0;
         }
-        for c in &mut self.cur { c.mag = 0.0; c.rate = 0.0; }
+        for c in &mut self.cur { c.mag = 0.0; c.rate = 0.0; c.noise_mag = 0.0; }
+        for s in &mut self.sec { s.dipole = NoiseSource::default(); }
+        self.lips_dipole = NoiseSource::default();
+    }
+
+    /// Seeds the noise generator (renders are reproducible for a given seed).
+    pub fn set_noise_seed(&mut self, seed: u64) {
+        self.rng = seed | 1;
     }
 
     /// Volume velocity (cm^3/s) injected into `section` (added to its continuity equation).
@@ -146,6 +277,7 @@ impl Tds {
         self.calc_matrix();
         self.solve();
         self.update();
+        self.position += 1;
         self.cur[RES_CUR].mag + self.cur[IND_CUR].mag
     }
 
@@ -210,6 +342,7 @@ impl Tds {
         if u > 0.0 && ta < sa {
             self.sec[LOWER_GLOTTIS].r[1] += u.abs() * 0.5 * AMBIENT_DENSITY * (1.0 / (ta * ta) - 1.0 / (sa * sa));
         }
+        if self.generate_noise { self.calc_noise_sources(); }
         // D and E of every section: P = D + E * (inflow - outflow).
         for (i, s) in self.sec.iter_mut().enumerate() {
             let mut src = 0.0;
@@ -218,6 +351,182 @@ impl Tds {
             s.e = d;
             s.d = s.pressure + dt * THETA1 * s.pressure_rate - d * (s.beta - src);
         }
+    }
+
+    /// Finds the constrictions (glottis, tongue, lower lip) and places the dipole noise sources.
+    fn calc_noise_sources(&mut self) {
+        const MAX_CONSTRICTION_AREA: f64 = 1.0;
+        const MAX_DELTA_AREA: f64 = 0.2;
+        const MAX_TEETH_DISTANCE: f64 = 2.0;
+        for s in &mut self.sec { s.dipole.target_amp = 0.0; }
+        self.lips_dipole.target_amp = 0.0;
+
+        let teeth = self.teeth_position;
+        let area = |sec: &Vec<Sec>, i: usize| sec[i].area;
+        let mut cons: Vec<Cons> = Vec::with_capacity(4);
+
+        // The aspiration source right above the glottis is always present.
+        let mut c0 = Cons::new(Articulator::VocalFolds);
+        c0.first = LOWER_GLOTTIS;
+        c0.last = UPPER_GLOTTIS;
+        c0.narrowest = UPPER_GLOTTIS;
+        c0.obstacle_pos = 1.5;
+        cons.push(c0);
+
+        // Extends [narrowest, narrowest] while the area stays within MAX_DELTA_AREA and the
+        // articulator matches, then trims by one section at each end (as VTL does).
+        let grow = |sec: &Vec<Sec>, narrowest: usize, art: Articulator, lo: usize, hi: usize| -> (usize, usize) {
+            let max_area = sec[narrowest].area + MAX_DELTA_AREA;
+            let (mut f, mut l) = (narrowest, narrowest);
+            while sec[f].area < max_area && sec[f].articulator == art && f > lo { f -= 1; }
+            while sec[l].area < max_area && sec[l].articulator == art && l < hi { l += 1; }
+            (f, l)
+        };
+        let obstacle_for = |sec: &Vec<Sec>, c: &Cons, min_for_teeth: &mut f64| -> f64 {
+            let jet_pos = sec[c.last].pos + sec[c.last].length;
+            if teeth - jet_pos < MAX_TEETH_DISTANCE {
+                *min_for_teeth = sec[c.narrowest].area;
+                teeth // /s, sh/
+            } else {
+                let n = (c.last + 1).min(NUM_SECTIONS - 1);
+                sec[n].pos + 0.5 * sec[n].length // /x, ch/
+            }
+        };
+
+        let mut min_tongue_for_teeth = 1.0e6;
+        // Most constricted tongue section.
+        let mut min_area = 1.0e6;
+        let mut min_sec = None;
+        for i in FIRST_PHARYNX..=LAST_MOUTH {
+            if self.sec[i].articulator == Articulator::Tongue && self.sec[i].area < min_area {
+                min_area = self.sec[i].area;
+                min_sec = Some(i);
+            }
+        }
+        if let (true, Some(ms)) = (min_area < MAX_CONSTRICTION_AREA, min_sec) {
+            let mut c = Cons::new(Articulator::Tongue);
+            c.narrowest = ms;
+            let (f, l) = grow(&self.sec, ms, Articulator::Tongue, FIRST_PHARYNX, LAST_MOUTH);
+            c.first = f + 1;
+            c.last = l.saturating_sub(1);
+            c.obstacle_pos = obstacle_for(&self.sec, &c, &mut min_tongue_for_teeth);
+            cons.push(c);
+        }
+        // A possible second constriction in the tongue region.
+        if cons.last().map(|c| c.articulator) == Some(Articulator::Tongue) {
+            let prev = *cons.last().unwrap();
+            let mut min_area = 1.0e6;
+            let mut min_sec = None;
+            for i in FIRST_PHARYNX..=LAST_MOUTH {
+                if self.sec[i].articulator == Articulator::Tongue && self.sec[i].area < min_area && (i < prev.first || i > prev.last) {
+                    min_area = self.sec[i].area;
+                    min_sec = Some(i);
+                }
+            }
+            if let (true, Some(ms)) = (min_area < MAX_CONSTRICTION_AREA, min_sec) {
+                let mut c = Cons::new(Articulator::Tongue);
+                c.narrowest = ms;
+                let (f, l) = grow(&self.sec, ms, Articulator::Tongue, FIRST_PHARYNX, LAST_MOUTH);
+                c.first = f + 1;
+                c.last = l.saturating_sub(1);
+                if c.first > prev.last + 1 || c.last + 1 < prev.first {
+                    c.obstacle_pos = obstacle_for(&self.sec, &c, &mut min_tongue_for_teeth);
+                    cons.push(c);
+                }
+            }
+        }
+        // Most constricted section at the lower lip.
+        let mut min_lip = 1.0e6;
+        let mut lip_sec = None;
+        for i in FIRST_MOUTH..=LAST_MOUTH {
+            if self.sec[i].articulator == Articulator::LowerLip && self.sec[i].area < min_lip {
+                min_lip = self.sec[i].area;
+                lip_sec = Some(i);
+            }
+        }
+        if let (true, Some(ls)) = (min_lip < MAX_CONSTRICTION_AREA && min_lip < min_tongue_for_teeth, lip_sec) {
+            let mut c = Cons::new(Articulator::LowerLip);
+            c.narrowest = ls;
+            let max_area = min_lip + MAX_DELTA_AREA;
+            let (f, mut l) = grow(&self.sec, ls, Articulator::LowerLip, FIRST_MOUTH, LAST_MOUTH);
+            c.first = f + 1;
+            if self.sec[l].area >= max_area { l -= 1; }
+            c.last = l;
+            c.obstacle_pos = 0.5 * (self.sec[c.first].pos + self.sec[c.last].pos + self.sec[c.last].length);
+            cons.push(c);
+        }
+
+        // Strength, spectrum and position of the dipole sources of every constriction.
+        for c in cons.iter_mut() {
+            let ts = &self.sec[c.narrowest];
+            c.area = ts.area.max(MIN_AREA_CM2);
+            let mut flow = 0.0;
+            for o in ts.cur_out.iter().flatten() { flow += self.cur[*o].noise_mag; }
+            c.flow = flow.max(0.0); // only outgoing flow makes noise (avoids clicks)
+            c.velocity = c.flow / c.area;
+            c.cutoff = 1000.0;
+            c.gain = 0.0;
+            match c.articulator {
+                Articulator::LowerLip => {
+                    let (gain_f, cutoff_f) = (2.0e-6, 8000.0); // /f/: flat spectrum
+                    let (gain_p, cutoff_p) = (0.5e-6, 500.0); // /p, b/ burst: low-frequency
+                    let mut area_at_teeth = 1.0e6;
+                    for i in FIRST_MOUTH..=LAST_MOUTH {
+                        if teeth >= self.sec[i].pos && teeth <= self.sec[i].pos + self.sec[i].length {
+                            area_at_teeth = area(&self.sec, i);
+                        }
+                    }
+                    let d = (-(area_at_teeth - 0.15) / 0.10).exp().min(1.0);
+                    c.gain = d * gain_f + (1.0 - d) * gain_p;
+                    c.cutoff = d * cutoff_f + (1.0 - d) * cutoff_p;
+                }
+                Articulator::VocalFolds => {
+                    c.gain = 1.0e-6 * 10f64.powf(self.aspiration_db / 20.0);
+                    c.cutoff = 10000.0; // flat aspiration spectrum
+                }
+                _ => {
+                    if (c.obstacle_pos - teeth).abs() < 0.0001 {
+                        // /s, sh, c, d, t/: fricatives are high-frequency, bursts lower.
+                        let (gain_fr, cutoff_fr) = (1.0e-6, 5000.0);
+                        let (gain_pl, cutoff_pl) = (0.8e-6, 1500.0);
+                        let d = self.tongue_tip_elevation.clamp(0.0, 1.0);
+                        c.gain = d * gain_fr + (1.0 - d) * gain_pl;
+                        c.cutoff = d * cutoff_fr + (1.0 - d) * cutoff_pl;
+                        if self.tongue_tip_elevation < 0.0 { c.gain = 0.0; } // lateral passage
+                    } else {
+                        c.gain = 0.4e-6; // wall source for /x, k/
+                        c.cutoff = 800.0;
+                    }
+                }
+            }
+            // Taper to zero between 0.5 and 1.0 cm^2 and below 0.15 cm^2 (prevents clicks).
+            if c.area >= 0.5 { c.gain *= 1.0 - (c.area - 0.5) / (MAX_CONSTRICTION_AREA - 0.5); }
+            if c.area < 0.15 { c.gain *= c.area / 0.15; }
+            c.full_amp = c.gain * c.velocity.abs() * c.velocity * c.velocity * c.area.sqrt();
+            c.cutoff = c.cutoff.clamp(1.0, 10000.0);
+
+            // Put the source at the obstacle: split between the two ends of its section.
+            let last = &self.sec[LAST_MOUTH];
+            if c.obstacle_pos >= last.pos + last.length { c.obstacle_pos = last.pos + 0.99 * last.length; }
+            let obstacle = (FIRST_PHARYNX..=LAST_MOUTH)
+                .find(|&i| self.sec[i].pos <= c.obstacle_pos && self.sec[i].pos + self.sec[i].length >= c.obstacle_pos);
+            if let Some(o) = obstacle {
+                let down = (c.obstacle_pos - self.sec[o].pos) / self.sec[o].length;
+                let up = 1.0 - down;
+                let (cutoff, full) = (c.cutoff, c.full_amp);
+                let s = &mut self.sec[o].dipole;
+                s.target_amp = up * full; s.first_order = false; s.cutoff = cutoff;
+                let s = if o < LAST_MOUTH { &mut self.sec[o + 1].dipole } else { &mut self.lips_dipole };
+                s.target_amp = down * full; s.first_order = false; s.cutoff = cutoff;
+            }
+        }
+
+        // New noise samples at the source positions.
+        let (pos, dt) = (self.position, self.dt);
+        for i in FIRST_PHARYNX..=LAST_MOUTH {
+            noise_sample(&mut self.sec[i].dipole, 0.001, pos, dt, &mut self.rng);
+        }
+        noise_sample(&mut self.lips_dipole, 0.001, pos, dt, &mut self.rng);
     }
 
     fn calc_matrix(&mut self) {
@@ -249,7 +558,7 @@ impl Tds {
                     if let Some(ci) = cin { self.matrix[i * N + ci] = e; }
                     self.matrix[i * N + RES_CUR] = -e - f;
                     self.matrix[i * N + IND_CUR] = -e - g;
-                    self.rhs[i] = h - d;
+                    self.rhs[i] = h - self.lips_dipole.sample - d;
                 }
                 Some(t) => {
                     let b = &self.sec[t];
@@ -262,6 +571,7 @@ impl Tds {
                     }
                     let (l_ab, r_ab) = (l_a + l_b, r_a + r_b);
                     let mut s_amp = 0.0;
+                    s_amp -= b.dipole.sample;
                     if Some(t) == self.pressure_source_section { s_amp -= self.pressure_source_amp; }
                     let (u, u_rate) = (self.cur[i].mag, self.cur[i].rate);
                     let g = l_ab / dtt + r_ab;
@@ -311,9 +621,11 @@ impl Tds {
 
     fn update(&mut self) {
         let dtt = self.dt * THETA;
+        let nf = (-2.0 * PI * NOISE_CUTOFF_FREQ * self.dt).exp();
         for i in 0..N {
             let old = self.cur[i].mag;
             self.cur[i].mag = self.flow[i];
+            self.cur[i].noise_mag = (1.0 - nf) * self.cur[i].mag + nf * self.cur[i].noise_mag;
             self.cur[i].rate = (self.cur[i].mag - old) / dtt - (THETA1 / THETA) * self.cur[i].rate;
         }
         for i in 0..NUM_SECTIONS {
@@ -422,6 +734,98 @@ mod tests {
         assert!(flow > 50.0 && flow < 2000.0, "flow {flow}");
         // The flow is in the correct direction (outwards) and finite.
         assert!(tds.section_pressure(FIRST_PHARYNX).is_finite());
+    }
+
+    /// Energy of the (differentiated, i.e. pressure-like) radiated flow in a frequency band.
+    fn band_energy(y: &[f64], f_lo: f64, f_hi: f64, fs: f64) -> f64 {
+        let n = 16384;
+        let seg = &y[y.len() - n - 1..];
+        let mut re: Vec<f64> = (0..n)
+            .map(|i| (seg[i + 1] - seg[i]) * (0.5 - 0.5 * (2.0 * PI * i as f64 / n as f64).cos()))
+            .collect();
+        let mut im = vec![0.0; n];
+        fft(&mut re, &mut im);
+        let bin = fs / n as f64;
+        (0..n / 2).filter(|&k| (k as f64 * bin) >= f_lo && (k as f64 * bin) <= f_hi).map(|k| re[k] * re[k] + im[k] * im[k]).sum()
+    }
+
+    fn run_noise(tube: &Tube, pressure_cmh2o: f64, seed: u64, samples: usize) -> Vec<f64> {
+        let mut tds = Tds::new(tube, 44100.0);
+        tds.set_noise_seed(seed);
+        tds.set_pressure_source(pressure_cmh2o * 980.665, FIRST_TRACHEA);
+        (0..samples).map(|_| tds.step()).collect()
+    }
+
+    fn sibilant_tube(narrow: f64) -> Tube {
+        let mut t = Tube::default();
+        t.set_glottis_area(0.3);
+        t.set_uniform_supraglottal(16.9, 4.0);
+        let mut tags = vec![Articulator::Other; NUM_SUPRAGLOTTAL];
+        let mut areas = vec![4.0; NUM_SUPRAGLOTTAL];
+        for (k, a) in [(32, narrow + 0.08), (33, narrow), (34, narrow + 0.08)] {
+            tags[k] = Articulator::Tongue;
+            areas[k] = a;
+        }
+        let lens = vec![16.9 / NUM_SUPRAGLOTTAL as f64; NUM_SUPRAGLOTTAL];
+        t.set_supraglottal(&lens, &areas);
+        t.set_articulators(&tags);
+        t.tongue_tip_side_elevation = 1.0; // fricative
+        t
+    }
+
+    #[test]
+    fn tongue_constriction_at_the_teeth_makes_high_frequency_noise() {
+        let with = run_noise(&sibilant_tube(0.12), 8.0, 7, 30000);
+        let mut open = Tube::default();
+        open.set_glottis_area(0.3);
+        open.set_uniform_supraglottal(16.9, 4.0); // fully open tube: aspiration only
+        let without = run_noise(&open, 8.0, 7, 30000);
+        let e_with = band_energy(&with, 3000.0, 8000.0, 44100.0);
+        let e_without = band_energy(&without, 3000.0, 8000.0, 44100.0);
+        println!("3-8 kHz energy: with constriction {e_with:.3e}, without {e_without:.3e}");
+        assert!(e_with > 10.0 * e_without, "{e_with} vs {e_without}");
+    }
+
+    #[test]
+    fn aspiration_noise_follows_aspiration_strength() {
+        let mk = |db: f64| {
+            let mut t = Tube::default();
+            t.set_glottis_area(0.3);
+            t.set_uniform_supraglottal(16.9, 4.0);
+            t.aspiration_strength_db = db;
+            band_energy(&run_noise(&t, 8.0, 3, 30000), 500.0, 6000.0, 44100.0)
+        };
+        let (quiet, loud) = (mk(-40.0), mk(-20.0));
+        println!("aspiration energy -40 dB: {quiet:.3e}, -20 dB: {loud:.3e}");
+        assert!(loud > 20.0 * quiet, "{loud} vs {quiet}");
+    }
+
+    #[test]
+    fn weak_aspiration_still_starts() {
+        // -60 dB: the target amplitude is below the level at which VTL's gate would never open.
+        let mut t = Tube::default();
+        t.set_glottis_area(0.3);
+        t.set_uniform_supraglottal(16.9, 4.0);
+        t.aspiration_strength_db = -60.0;
+        let e = band_energy(&run_noise(&t, 8.0, 3, 30000), 500.0, 6000.0, 44100.0);
+        println!("aspiration energy at -60 dB: {e:.3e}");
+        assert!(e > 100.0, "{e}");
+    }
+
+    #[test]
+    fn no_flow_means_no_noise() {
+        let y = run_noise(&sibilant_tube(0.12), 0.0, 5, 5000);
+        assert!(y.iter().all(|v| v.abs() < 1e-9));
+    }
+
+    #[test]
+    fn noise_is_reproducible_for_a_seed() {
+        let t = sibilant_tube(0.12);
+        let a = run_noise(&t, 8.0, 11, 6000);
+        let b = run_noise(&t, 8.0, 11, 6000);
+        let c = run_noise(&t, 8.0, 12, 6000);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
     }
 
     #[test]

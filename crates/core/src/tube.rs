@@ -26,12 +26,13 @@ pub const STANDARD_WALL_RESISTANCE: f64 = 5000.0;
 pub const STANDARD_WALL_STIFFNESS: f64 = 100_000.0;
 
 /// Which articulator a section lies in (used later for fricative noise sources).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Articulator {
     VocalFolds,
     Tongue,
     LowerIncisors,
     LowerLip,
+    #[default]
     Other,
 }
 
@@ -54,6 +55,12 @@ impl Section {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tube {
     pub sections: Vec<Section>,
+    /// Position of the upper incisors, measured from the upper end of the glottis (cm).
+    pub teeth_position_cm: f64,
+    /// Aspiration noise strength at the glottis (dB). VTL default: -40 dB.
+    pub aspiration_strength_db: f64,
+    /// Elevation of the tongue-tip sides: 1 = fricative-like, 0 = plosive-like, < 0 = lateral.
+    pub tongue_tip_side_elevation: f64,
 }
 
 impl Default for Tube {
@@ -82,7 +89,7 @@ impl Default for Tube {
                 articulator: Articulator::Other,
             });
         }
-        Tube { sections }
+        Tube { sections, teeth_position_cm: 15.0, aspiration_strength_db: -40.0, tongue_tip_side_elevation: 0.0 }
     }
 }
 
@@ -104,6 +111,31 @@ impl Tube {
             s.length_cm = length_cm[k];
             s.area_cm2 = area_cm2[k].max(MIN_AREA_CM2);
         }
+    }
+
+    /// Assigns the articulator of each of the 40 supraglottal sections (used to place noise sources).
+    pub fn set_articulators(&mut self, tags: &[Articulator]) {
+        assert_eq!(tags.len(), NUM_SUPRAGLOTTAL);
+        for k in 0..NUM_SUPRAGLOTTAL {
+            self.sections[FIRST_PHARYNX + k].articulator = tags[k];
+        }
+    }
+
+    /// Section start positions (cm) along the tract, as in VTL: 0 is the upper end of the
+    /// glottis, positions increase towards the lips and are negative in the glottis and trachea.
+    pub fn positions(&self) -> Vec<f64> {
+        let mut pos = vec![0.0; NUM_SECTIONS];
+        let mut p = 0.0;
+        for i in (0..FIRST_PHARYNX).rev() {
+            p -= self.sections[i].length_cm;
+            pos[i] = p;
+        }
+        let mut p = 0.0;
+        for i in FIRST_PHARYNX..NUM_SECTIONS {
+            pos[i] = p;
+            p += self.sections[i].length_cm;
+        }
+        pos
     }
 
     /// A uniform supraglottal tube of the given total length and area.
