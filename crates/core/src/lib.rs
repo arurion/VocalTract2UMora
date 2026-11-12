@@ -20,4 +20,5 @@ pub mod surface;
 pub mod synth;
 pub mod tds;
 pub mod tube;
+pub mod vocal_tract;
 pub mod xml;
