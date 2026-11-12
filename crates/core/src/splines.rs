@@ -161,6 +161,15 @@ impl LineStrip3D {
         self.changed = true;
     }
 
+    pub fn reset(&mut self, n: usize) {
+        self.p = vec![P3::default(); n.min(MAX_SPLINE_POINTS)];
+        self.changed = true;
+    }
+
+    pub fn set_point(&mut self, i: usize, pt: P3) {
+        if i < self.p.len() { self.p[i] = pt; self.changed = true; }
+    }
+
     pub fn add_point(&mut self, pt: P3) {
         if self.p.len() >= MAX_SPLINE_POINTS { return; }
         self.p.push(pt);

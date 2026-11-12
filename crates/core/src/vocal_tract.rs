@@ -9,7 +9,7 @@
 
 use crate::geom::*;
 use crate::speaker::{Anatomy, Speaker, NUM_PARAMS};
-use crate::splines::{Bezier3D, LineStrip3D};
+use crate::splines::{Bezier3D, LineStrip2D, LineStrip3D};
 use crate::surface::Surface;
 use std::f64::consts::PI;
 
@@ -80,7 +80,50 @@ pub mod si {
     pub const NUM_SURFACES: usize = 32;
 }
 
+/// Indices of the articulatory parameters.
+pub mod pi {
+    pub const HX: usize = 0;
+    pub const HY: usize = 1;
+    pub const JX: usize = 2;
+    pub const JA: usize = 3;
+    pub const LP: usize = 4;
+    pub const LD: usize = 5;
+    pub const VS: usize = 6;
+    pub const VO: usize = 7;
+    pub const TCX: usize = 8;
+    pub const TCY: usize = 9;
+    pub const TTX: usize = 10;
+    pub const TTY: usize = 11;
+    pub const TBX: usize = 12;
+    pub const TBY: usize = 13;
+    pub const TRX: usize = 14;
+    pub const TRY: usize = 15;
+    pub const TS1: usize = 16;
+    pub const TS2: usize = 17;
+    pub const TS3: usize = 18;
+}
+use pi::*;
+
+/// State of one articulatory parameter: the value set by the caller (`x`, clamped to the range)
+/// and the value after the biomechanical limits (`limited_x`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParamState {
+    pub x: f64,
+    pub limited_x: f64,
+    pub min: f64,
+    pub max: f64,
+    pub neutral: f64,
+}
+
 pub struct VocalTract {
+    pub param: [ParamState; NUM_PARAMS],
+    pub lower_gums_inner_edge: [P3; NUM_JAW_RIBS],
+    pub lower_gums_outer_edge: [P3; NUM_JAW_RIBS],
+    pub lip_corner_path: LineStrip3D,
+    pub upper_outline: LineStrip2D,
+    pub lower_outline: LineStrip2D,
+    pub tongue_outline: LineStrip2D,
+    pub epiglottis_outline: LineStrip2D,
     pub anatomy: Anatomy,
     pub palate_points: Vec<P3>,
     pub jaw_points: Vec<P3>,
@@ -99,7 +142,19 @@ impl VocalTract {
         let anatomy = speaker.anatomy.clone();
         let palate_points = anatomy.palate.iter().map(|r| p3(r.x, 0.0, r.z)).collect();
         let jaw_points = anatomy.jaw.iter().map(|r| p3(r.x, 0.0, r.z)).collect();
+        let mut param = [ParamState::default(); NUM_PARAMS];
+        for (i, p) in speaker.params.iter().enumerate() {
+            param[i] = ParamState { x: p.neutral, limited_x: p.neutral, min: p.min, max: p.max, neutral: p.neutral };
+        }
         let mut vt = VocalTract {
+            param,
+            lower_gums_inner_edge: [P3::default(); NUM_JAW_RIBS],
+            lower_gums_outer_edge: [P3::default(); NUM_JAW_RIBS],
+            lip_corner_path: LineStrip3D::new(),
+            upper_outline: LineStrip2D::new(),
+            lower_outline: LineStrip2D::new(),
+            tongue_outline: LineStrip2D::new(),
+            epiglottis_outline: LineStrip2D::new(),
             anatomy,
             palate_points,
             jaw_points,
@@ -117,6 +172,599 @@ impl VocalTract {
         vt.init_velum();
         vt
     }
+
+    /// Sets the articulatory parameters (clamped to their ranges when the model is calculated).
+    pub fn set_params(&mut self, values: &[f64; NUM_PARAMS]) {
+        for i in 0..NUM_PARAMS { self.param[i].x = values[i]; }
+    }
+
+    fn restrict_param(&mut self, i: usize) {
+        let p = &mut self.param[i];
+        if p.x < p.min { p.x = p.min; }
+        if p.x > p.max { p.x = p.max; }
+    }
+
+    /// Rotates a point of the lower jaw about the jaw fulcrum (jaw angle JA, jaw position JX).
+    fn jaw_transform(&self, v: P3, cosinus: f64, sinus: f64, jx_factor: f64) -> P3 {
+        let a = &self.anatomy;
+        let dx = v.x + a.jaw_rest_pos[0] + jx_factor * self.param[JX].x - a.jaw_fulcrum[0];
+        let dy = v.y + a.jaw_rest_pos[1] - a.jaw_fulcrum[1];
+        p3(cosinus * dx - sinus * dy + a.jaw_fulcrum[0], sinus * dx + cosinus * dy + a.jaw_fulcrum[1], v.z)
+    }
+
+    /// Recomputes every surface for the current parameters.
+    pub fn calc_surfaces(&mut self) {
+        for i in 0..NUM_PARAMS { self.restrict_param(i); }
+        let pr = self.anatomy.pharynx_rotation_angle_deg;
+        let shear_coeff = (pr * PI / 180.0).cos() / (pr * PI / 180.0).sin();
+
+        // Jaw rotation; the hyoid cannot be lower than the jaw allows.
+        let angle_rad = self.param[JA].x * PI / 180.0;
+        let (cosinus, sinus) = (angle_rad.cos(), angle_rad.sin());
+        let vertex = self.jaw_transform(self.surface[si::MANDIBLE].get_vertex(0, NUM_LOWER_COVER_POINTS - 1), cosinus, sinus, 1.0);
+        if self.param[HY].x > vertex.y { self.param[HY].limited_x = vertex.y; }
+
+        let p = self.surface[si::NARROW_LARYNX_FRONT].get_vertex(NUM_LARYNX_RIBS - 1, NUM_LOWER_COVER_POINTS - 1);
+        let q = self.surface[si::WIDE_LARYNX_FRONT].get_vertex(NUM_LARYNX_RIBS - 1, NUM_LOWER_COVER_POINTS - 1);
+        let x_offset = self.get_pharynx_back_x(self.param[HY].limited_x);
+        let mut t = q.x - p.x;
+        if t.abs() < 0.000001 { t = 0.000001; }
+        let max_hx = (vertex.x - x_offset - p.x) / t;
+        if self.param[HX].x > max_hx { self.param[HX].limited_x = max_hx; }
+        if self.param[HX].limited_x < self.param[HX].min { self.param[HX].limited_x = self.param[HX].min; }
+        if self.param[HX].limited_x > self.param[HX].max { self.param[HX].limited_x = self.param[HX].max; }
+
+        // Upper cover: larynx (back), pharynx, velum, palate.
+        let mut rib = 0;
+        let t = self.param[HX].limited_x;
+        let x = self.get_pharynx_back_x(self.param[HY].limited_x);
+        for i in 0..NUM_LARYNX_RIBS {
+            for k in 0..NUM_UPPER_COVER_POINTS {
+                let p = self.surface[si::NARROW_LARYNX_BACK].get_vertex(i, k);
+                let q = self.surface[si::WIDE_LARYNX_BACK].get_vertex(i, k);
+                let mut p = p * (1.0 - t) + q * t;
+                let shear_x = p.y * shear_coeff;
+                p.x += x + shear_x;
+                p.y += self.param[HY].limited_x;
+                self.surface[si::UPPER_COVER].set_vertex(rib, k, p);
+            }
+            rib += 1;
+        }
+        const PHARYNX_X: [f64; NUM_UPPER_COVER_POINTS] = [1.0, 0.69, 0.41, 0.19, 0.05, 0.0];
+        const PHARYNX_Z: [f64; NUM_UPPER_COVER_POINTS] = [-1.0, -0.95, -0.81, -0.59, -0.31, 0.0];
+        for i in 0..NUM_PHARYNX_RIBS {
+            let t = i as f64 / (NUM_PHARYNX_RIBS - 1) as f64;
+            let scale_z = 0.5 * ((1.0 - t) * self.anatomy.pharynx_lower_depth + t * self.anatomy.pharynx_upper_depth);
+            let scale_x = self.anatomy.pharynx_back_width;
+            let t = (i + 1) as f64 / NUM_PHARYNX_RIBS as f64;
+            let y = (1.0 - t) * self.param[HY].limited_x + t * self.anatomy.pharynx_top_rib_y;
+            let x = self.get_pharynx_back_x(y);
+            for k in 0..NUM_UPPER_COVER_POINTS {
+                self.surface[si::UPPER_COVER].set_vertex(rib, k, p3(x + scale_x * PHARYNX_X[k], y, scale_z * PHARYNX_Z[k]));
+            }
+            rib += 1;
+        }
+        let s = (self.param[VS].x - self.param[VS].min) / (self.param[VS].max - self.param[VS].min);
+        let t = self.param[VO].x.clamp(0.0, 1.0);
+        for i in 0..NUM_VELUM_RIBS {
+            for k in 0..NUM_UPPER_COVER_POINTS {
+                let p = self.surface[si::HIGH_VELUM].get_vertex(i, k);
+                let q = self.surface[si::MID_VELUM].get_vertex(i, k);
+                let r = self.surface[si::LOW_VELUM].get_vertex(i, k);
+                let mut a = p * (1.0 - s) + q * s;
+                a = a * (1.0 - t) + r * t;
+                self.surface[si::UPPER_COVER].set_vertex(rib, k, a);
+            }
+            rib += 1;
+        }
+        let last_velum_rib = rib - 1;
+        for i in 0..NUM_JAW_RIBS {
+            let factor = self.palate_points[i].x / 1.2;
+            if factor < 1.0 {
+                for k in 0..NUM_UPPER_COVER_POINTS {
+                    let p = self.surface[si::UPPER_COVER].get_vertex(last_velum_rib, k);
+                    let q = self.surface[si::PALATE].get_vertex(i, k);
+                    let mut vtx = P3::default();
+                    vtx.x = q.x;
+                    vtx.y = (1.0 - factor) * p.y + factor * q.y;
+                    vtx.z = if q.x < 0.01 { p.z } else { q.z };
+                    self.surface[si::UPPER_COVER].set_vertex(rib, k, vtx);
+                }
+            } else {
+                for k in 0..NUM_UPPER_COVER_POINTS {
+                    let v = self.surface[si::PALATE].get_vertex(i, k);
+                    self.surface[si::UPPER_COVER].set_vertex(rib, k, v);
+                }
+            }
+            rib += 1;
+        }
+
+        // Lower cover: larynx (front), throat, lower jaw.
+        let mut rib = 0;
+        let t = self.param[HX].limited_x;
+        let x = self.get_pharynx_back_x(self.param[HY].limited_x);
+        for i in 0..NUM_LARYNX_RIBS {
+            for k in 0..NUM_LOWER_COVER_POINTS {
+                let p = self.surface[si::NARROW_LARYNX_FRONT].get_vertex(i, k);
+                let q = self.surface[si::WIDE_LARYNX_FRONT].get_vertex(i, k);
+                let mut p = p * (1.0 - t) + q * t;
+                let shear_x = p.y * shear_coeff;
+                p.x += x + shear_x;
+                p.y += self.param[HY].limited_x;
+                self.surface[si::LOWER_COVER].set_vertex(rib, k, p);
+            }
+            rib += 1;
+        }
+        rib += NUM_THROAT_RIBS;
+        for i in 0..NUM_JAW_RIBS {
+            for k in 0..NUM_LOWER_COVER_POINTS {
+                let v = self.jaw_transform(self.surface[si::MANDIBLE].get_vertex(i, k), cosinus, sinus, 1.0);
+                self.surface[si::LOWER_COVER].set_vertex(rib, k, v);
+            }
+            rib += 1;
+            self.lower_gums_outer_edge[i] = self.jaw_transform(self.lower_gums_outer_edge_orig[i], cosinus, sinus, 1.0);
+            self.lower_gums_inner_edge[i] = self.jaw_transform(self.lower_gums_inner_edge_orig[i], cosinus, sinus, 1.0);
+        }
+        // Throat ribs of the lower cover.
+        let weight = [1.0, 0.71, 1.0];
+        let mut curve = Bezier3D::new();
+        let r = self.surface[si::LOWER_COVER].get_vertex(NUM_LARYNX_RIBS - 1, NUM_LOWER_COVER_POINTS - 1);
+        for i in 0..NUM_THROAT_RIBS {
+            let q = self.surface[si::UPPER_COVER].get_vertex(NUM_LARYNX_RIBS + i, 0);
+            curve.set_points_weighted(&[q, p3(r.x, r.y, q.z), r], &weight);
+            for k in 0..NUM_LOWER_COVER_POINTS {
+                let q = curve.get_point(k as f64 / (NUM_LOWER_COVER_POINTS - 1) as f64);
+                self.surface[si::LOWER_COVER].set_vertex(NUM_LARYNX_RIBS + i, k, q);
+            }
+        }
+        // Lower teeth follow the jaw.
+        for i in 0..NUM_TEETH_RIBS {
+            for k in 0..NUM_TEETH_POINTS {
+                let v = self.jaw_transform(self.surface[si::LOWER_TEETH_ORIGINAL].get_vertex(i, k), cosinus, sinus, 1.0);
+                self.surface[si::LOWER_TEETH].set_vertex(i, k, v);
+            }
+        }
+
+        self.calc_lips();
+
+        // Fill surfaces between the covers (left side).
+        let uc = |s: &VocalTract, r: usize| s.surface[si::UPPER_COVER].get_vertex(r, 0);
+        let lc = |s: &VocalTract, r: usize| s.surface[si::LOWER_COVER].get_vertex(r, 0);
+        let n_l = NUM_LARYNX_RIBS;
+        let n_p = NUM_PHARYNX_RIBS;
+        let n_v = NUM_VELUM_RIBS;
+        let fill = [
+            (uc(self, n_l + n_p), lc(self, n_l + n_p - 1)),
+            (uc(self, n_l + n_p + n_v - 1), lc(self, n_l + n_p)),
+            (uc(self, n_l + n_p + n_v), lc(self, n_l + n_p)),
+        ];
+        for (rb, (up, lo)) in fill.iter().enumerate() {
+            self.surface[si::LEFT_COVER].set_vertex(rb, 0, *up);
+            self.surface[si::LEFT_COVER].set_vertex(rb, 1, *up);
+            self.surface[si::LEFT_COVER].set_vertex(rb, 2, *lo);
+            self.surface[si::LEFT_COVER].set_vertex(rb, 3, *lo);
+        }
+        let z_lip = [self.surface[si::UPPER_LIP].get_vertex(0, 0).z, self.surface[si::LOWER_LIP].get_vertex(0, 0).z];
+        let mut inner_point = P3::default();
+        let mut outer_point = P3::default();
+        for k in 0..2 {
+            let (inner_edge, outer_edge) = if k == 0 {
+                (self.upper_gums_inner_edge, self.upper_gums_outer_edge)
+            } else {
+                (self.lower_gums_inner_edge, self.lower_gums_outer_edge)
+            };
+            for i in 0..NUM_JAW_RIBS - 1 {
+                let p = inner_edge[i];
+                let q = inner_edge[i + 1];
+                let length = q.z - p.z;
+                if p.z <= z_lip[k] {
+                    inner_point = inner_edge[i];
+                    outer_point = outer_edge[i];
+                }
+                if p.z <= z_lip[k] && q.z >= z_lip[k] && length > 0.0 {
+                    let t = (z_lip[k] - p.z) / length;
+                    inner_point = inner_edge[i] + (inner_edge[i + 1] - inner_edge[i]) * t;
+                    outer_point = outer_edge[i] + (outer_edge[i + 1] - outer_edge[i]) * t;
+                }
+                if k == 0 {
+                    self.surface[si::LEFT_COVER].set_vertex(3 + i, 0, inner_point);
+                    self.surface[si::LEFT_COVER].set_vertex(3 + i, 1, outer_point);
+                } else {
+                    self.surface[si::LEFT_COVER].set_vertex(3 + i, 2, outer_point);
+                    self.surface[si::LEFT_COVER].set_vertex(3 + i, 3, inner_point);
+                }
+            }
+            if k == 0 {
+                self.surface[si::LEFT_COVER].set_vertex(NUM_FILL_RIBS - 1, 0, inner_point);
+                self.surface[si::LEFT_COVER].set_vertex(NUM_FILL_RIBS - 1, 1, outer_point);
+            } else {
+                self.surface[si::LEFT_COVER].set_vertex(NUM_FILL_RIBS - 1, 2, outer_point);
+                self.surface[si::LEFT_COVER].set_vertex(NUM_FILL_RIBS - 1, 3, inner_point);
+            }
+        }
+
+        // Upper and lower outlines of the sagittal contour.
+        let upper_cover_point = NUM_UPPER_COVER_POINTS - 1;
+        let lower_cover_point = NUM_LOWER_COVER_POINTS - 1;
+        let tongue_point = NUM_TONGUE_POINTS / 4;
+        let lip_rib = NUM_LIP_RIBS - 1;
+        let teeth_rib = NUM_TEETH_RIBS - 1;
+        self.upper_outline.reset(0);
+        for i in 0..NUM_UPPER_COVER_RIBS {
+            let v = self.surface[si::UPPER_COVER].get_vertex(i, upper_cover_point).to_p2();
+            self.upper_outline.add_point(v);
+        }
+        for i in 0..NUM_TEETH_POINTS - 1 {
+            let v = self.surface[si::UPPER_TEETH].get_vertex(teeth_rib, i).to_p2();
+            self.upper_outline.add_point(v);
+        }
+        for i in 0..NUM_INNER_LIP_POINTS + 2 {
+            let v = self.surface[si::UPPER_LIP].get_vertex(lip_rib, i).to_p2();
+            self.upper_outline.add_point(v);
+        }
+        while self.upper_outline.get_control_point(self.upper_outline.num_points() as i64 - 1).x
+            <= self.upper_outline.get_control_point(self.upper_outline.num_points() as i64 - 2).x {
+            self.upper_outline.del_point();
+        }
+        self.lower_outline.reset(0);
+        for i in 0..NUM_LOWER_COVER_RIBS {
+            let v = self.surface[si::LOWER_COVER].get_vertex(i, lower_cover_point).to_p2();
+            self.lower_outline.add_point(v);
+        }
+        for i in 0..NUM_TEETH_POINTS - 1 {
+            let v = self.surface[si::LOWER_TEETH].get_vertex(teeth_rib, i).to_p2();
+            self.lower_outline.add_point(v);
+        }
+        for i in 0..NUM_INNER_LIP_POINTS + 2 {
+            let v = self.surface[si::LOWER_LIP].get_vertex(lip_rib, i).to_p2();
+            self.lower_outline.add_point(v);
+        }
+        while self.lower_outline.get_control_point(self.lower_outline.num_points() as i64 - 1).x
+            <= self.lower_outline.get_control_point(self.lower_outline.num_points() as i64 - 2).x {
+            self.lower_outline.del_point();
+        }
+
+        self.calc_tongue();
+
+        // Epiglottis: follows the larynx and is pushed back by the tongue root.
+        let p = self.surface[si::LOWER_COVER].get_vertex(NUM_LARYNX_RIBS - 2, NUM_LOWER_COVER_POINTS - 1);
+        let q = self.surface[si::LOWER_COVER].get_vertex(NUM_LARYNX_RIBS - 1, NUM_LOWER_COVER_POINTS - 1);
+        let mut v = q - p;
+        v.normalize();
+        let a = p + v * self.anatomy.epiglottis_width;
+        for k in 0..NUM_EPIGLOTTIS_POINTS {
+            let p = self.surface[si::EPIGLOTTIS_ORIGINAL].get_vertex(0, k);
+            let (x, y, z) = (v.x * p.x - v.y * p.y, v.y * p.x + v.x * p.y, p.z);
+            self.surface[si::EPIGLOTTIS].set_vertex(0, k, p3(x + a.x, y + a.y, z + a.z));
+        }
+        let mut min_angle_rad = self.anatomy.epiglottis_angle_deg * PI / 180.0;
+        for i in 1..10 {
+            let mut p = self.surface[si::TONGUE].get_vertex(i, NUM_TONGUE_POINTS / 2) - a;
+            if p.y < self.anatomy.epiglottis_height {
+                if p.y < 0.01 { p.y = 0.01; }
+                let angle_rad = p.y.atan2(p.x);
+                if angle_rad > min_angle_rad { min_angle_rad = angle_rad; }
+            }
+        }
+        min_angle_rad -= 0.5 * PI;
+        if min_angle_rad > 0.25 * PI { min_angle_rad = 0.25 * PI; }
+        let (sinus, cosinus) = (min_angle_rad.sin(), min_angle_rad.cos());
+        for i in 1..NUM_EPIGLOTTIS_RIBS {
+            for k in 0..NUM_EPIGLOTTIS_POINTS {
+                let p = self.surface[si::EPIGLOTTIS_ORIGINAL].get_vertex(i, k);
+                let (x, y, z) = (cosinus * p.x - sinus * p.y, sinus * p.x + cosinus * p.y, p.z);
+                self.surface[si::EPIGLOTTIS].set_vertex(i, k, p3(x + a.x, y + a.y, z + a.z));
+            }
+        }
+        // Uvula hangs from the velum.
+        let a = self.surface[si::UPPER_COVER].get_vertex(NUM_LARYNX_RIBS + NUM_PHARYNX_RIBS + 1, NUM_UPPER_COVER_POINTS - 1);
+        for i in 0..NUM_UVULA_RIBS {
+            for k in 0..NUM_UVULA_POINTS {
+                let p = self.surface[si::UVULA_ORIGINAL].get_vertex(i, k) + a;
+                self.surface[si::UVULA].set_vertex(i, k, p);
+            }
+        }
+        self.tongue_outline.reset(0);
+        for i in 0..NUM_TONGUE_RIBS {
+            let v = self.surface[si::TONGUE].get_vertex(i, tongue_point).to_p2();
+            self.tongue_outline.add_point(v);
+        }
+        self.epiglottis_outline.reset(0);
+        for i in 0..NUM_EPIGLOTTIS_RIBS {
+            let v = self.surface[si::EPIGLOTTIS].get_vertex(i, NUM_EPIGLOTTIS_POINTS - 1).to_p2();
+            self.epiglottis_outline.add_point(v);
+        }
+        for i in (0..=(NUM_EPIGLOTTIS_RIBS as i64 - 2)).rev() {
+            let v = self.surface[si::EPIGLOTTIS].get_vertex(i as usize, 0).to_p2();
+            self.epiglottis_outline.add_point(v);
+        }
+
+        // Mirror the half surfaces to get the two-sided versions used for the cross-sections.
+        self.mirror_points(si::UPPER_COVER, si::UPPER_COVER_TWOSIDE);
+        self.mirror_points(si::LOWER_COVER, si::LOWER_COVER_TWOSIDE);
+        self.mirror_ribs(si::UPPER_TEETH, si::UPPER_TEETH_TWOSIDE);
+        self.mirror_ribs(si::LOWER_TEETH, si::LOWER_TEETH_TWOSIDE);
+        self.mirror_ribs(si::UPPER_LIP, si::UPPER_LIP_TWOSIDE);
+        self.mirror_ribs(si::LOWER_LIP, si::LOWER_LIP_TWOSIDE);
+        for i in 0..self.surface[si::LEFT_COVER].num_ribs {
+            for k in 0..self.surface[si::LEFT_COVER].num_rib_points {
+                let mut p = self.surface[si::LEFT_COVER].get_vertex(i, k);
+                p.z = -p.z;
+                self.surface[si::RIGHT_COVER].set_vertex(i, k, p);
+            }
+        }
+        self.mirror_points(si::EPIGLOTTIS, si::EPIGLOTTIS_TWOSIDE);
+        self.mirror_points(si::UVULA, si::UVULA_TWOSIDE);
+    }
+
+    /// Copies a half surface into a two-sided one by mirroring the rib points (z -> -z).
+    fn mirror_points(&mut self, source: usize, target: usize) {
+        let (nr, np_t) = (self.surface[target].num_ribs, self.surface[target].num_rib_points);
+        let np = self.surface[source].num_rib_points;
+        for i in 0..nr {
+            for k in 0..np {
+                let mut p = self.surface[source].get_vertex(i, k);
+                self.surface[target].set_vertex(i, k, p);
+                p.z = -p.z;
+                self.surface[target].set_vertex(i, np_t - 1 - k, p);
+            }
+        }
+    }
+
+    /// Same, but mirroring the ribs.
+    fn mirror_ribs(&mut self, source: usize, target: usize) {
+        let nr_t = self.surface[target].num_ribs;
+        let (nr, np) = (self.surface[source].num_ribs, self.surface[source].num_rib_points);
+        for i in 0..nr {
+            for k in 0..np {
+                let mut p = self.surface[source].get_vertex(i, k);
+                self.surface[target].set_vertex(i, k, p);
+                p.z = -p.z;
+                self.surface[target].set_vertex(nr_t - 1 - i, k, p);
+            }
+        }
+    }
+
+    /// Lip geometry: the corner path between the wide and the narrow position, the lip
+    /// openings and the mouth radiation surface follow LD (distance) and LP (protrusion).
+    fn get_important_lip_points(&mut self) -> (P3, P3, P3, P3, f64) {
+        let n = self.narrow_lip_corner_path.num_points();
+        let angle_rad = 0.5 * self.param[JA].x * PI / 180.0;
+        let (cosinus, sinus) = (angle_rad.cos(), angle_rad.sin());
+        self.lip_corner_path.reset(n);
+        let t = (self.param[LD].x - self.param[LD].min) / (self.param[LD].max - self.param[LD].min);
+        let a = self.anatomy.clone();
+        for i in 0..n {
+            let q = self.narrow_lip_corner_path.get_control_point(i) * (1.0 - t) + self.wide_lip_corner_path.get_control_point(i) * t;
+            let dx = q.x + a.jaw_rest_pos[0] + 0.5 * self.param[JX].x - a.jaw_fulcrum[0];
+            let dy = q.y + 0.5 * a.jaw_rest_pos[1] - a.jaw_fulcrum[1];
+            let r = p3(cosinus * dx - sinus * dy + a.jaw_fulcrum[0], sinus * dx + cosinus * dy + a.jaw_fulcrum[1], q.z);
+            self.lip_corner_path.set_point(i, r);
+        }
+        let mut lip_corner_separation_x = self.upper_gums_outer_edge[6].x;
+        if self.lower_gums_outer_edge[6].x < lip_corner_separation_x {
+            lip_corner_separation_x = self.lower_gums_outer_edge[6].x;
+        }
+        let t0 = self.narrow_lip_corner_path.get_intersection(p3(lip_corner_separation_x, 0.0, 0.0), p3(1.0, 0.0, 0.0));
+        let t = (self.param[LP].x - self.param[LP].min) / (self.param[LP].max - self.param[LP].min);
+        let corner = self.lip_corner_path.get_point(t);
+        let onset = if t > t0 { self.lip_corner_path.get_point(t0) } else { corner };
+
+        let t0v = self.upper_gums_outer_edge[8];
+        let t1v = self.lower_gums_outer_edge[8];
+        const X_OFFSET: f64 = 0.1;
+        let y_offset = 0.35 - t * 0.3;
+        const L_MAX: f64 = 1.0;
+        const L_MIN: f64 = 0.3;
+        let t = (self.param[LP].x - self.param[LP].min) / (self.param[LP].max - self.param[LP].min);
+        let l = (1.0 - t) * L_MAX + t * L_MIN;
+        let mut f0 = P3::default();
+        let mut f1 = P3::default();
+        f0.x = corner.x + l + 0.3;
+        f1.x = corner.x + l;
+        if f0.x < t0v.x + X_OFFSET { f0.x = t0v.x + X_OFFSET; }
+        if f1.x < t1v.x + X_OFFSET { f1.x = t1v.x + X_OFFSET; }
+        const MIN_T: f64 = -0.05;
+        let t = (self.param[LP].x - self.param[LP].min) / (self.param[LP].max - self.param[LP].min);
+        let y_close = 0.5 * (t0v.y + t1v.y) + (1.0 - t) * y_offset;
+        let mut t = 0.5 * self.param[LD].x;
+        if t < MIN_T { t = MIN_T; }
+        f0.y = y_close + t;
+        f1.y = y_close - t;
+        if f0.y > t0v.y { f0.y = t0v.y; }
+        if f1.y > t0v.y { f1.y = t0v.y; }
+        if f0.y < t1v.y { f0.y = t1v.y; }
+        if f1.y < t1v.y { f1.y = t1v.y; }
+        let lip_tangent = self.upper_gums_outer_edge[5] - self.upper_gums_outer_edge[0];
+        f0.z = corner.z + (lip_tangent.z / lip_tangent.x) * (f0.x - corner.x);
+        f1.z = corner.z + (lip_tangent.z / lip_tangent.x) * (f1.x - corner.x);
+        (onset, corner, f0, f1, y_close)
+    }
+
+    fn calc_lips(&mut self) {
+        const EPS: f64 = 0.000001;
+        let (onset, corner, f0, f1, _y_close) = self.get_important_lip_points();
+        let mut lip_radius = self.anatomy.lips_width - 0.4;
+        if lip_radius < 0.4 { lip_radius = 0.4; }
+
+        let mut upper_path = LineStrip3D::new();
+        let mut lower_path = LineStrip3D::new();
+        let n = self.lip_corner_path.num_points();
+        for i in 0..n.saturating_sub(1) {
+            let p0 = self.lip_corner_path.get_control_point(i);
+            let p1 = self.lip_corner_path.get_control_point(i + 1);
+            if p0.x <= onset.x && p1.x >= onset.x {
+                upper_path.add_point(onset);
+                lower_path.add_point(onset);
+            }
+            if p0.x > onset.x && p0.x < corner.x {
+                upper_path.add_point(p0);
+                lower_path.add_point(p0);
+            }
+            if p0.x <= corner.x && p1.x >= corner.x {
+                upper_path.add_point(corner);
+                lower_path.add_point(corner);
+            }
+        }
+        let mut curve = Bezier3D::new();
+        curve.set_points_weighted(&[corner, f0, p3(f0.x, f0.y, 0.0)], &[1.0, 1.5, 1.0]);
+        for i in 1..=7 { upper_path.add_point(curve.get_point(i as f64 / 7.0)); }
+        curve.set_points_weighted(&[corner, f1, p3(f1.x, f1.y, 0.0)], &[1.0, 1.5, 1.0]);
+        for i in 1..=7 { lower_path.add_point(curve.get_point(i as f64 / 7.0)); }
+
+        for upper in [true, false] {
+            let (outer_edge, inner_edge) = if upper {
+                (self.upper_gums_outer_edge, self.upper_gums_inner_edge)
+            } else {
+                (self.lower_gums_outer_edge, self.lower_gums_inner_edge)
+            };
+            let mut outer_origin = [P3::default(); 32];
+            let mut inner_origin = [P3::default(); 32];
+            let mut num_ribs = 0usize;
+            for i in 1..NUM_JAW_RIBS {
+                let (p0, p1) = (outer_edge[i - 1], outer_edge[i]);
+                let mut length = p1.x - p0.x;
+                if length < EPS { length = EPS; }
+                let (q0, q1) = (inner_edge[i - 1], inner_edge[i]);
+                if p0.x <= onset.x && p1.x >= onset.x {
+                    let t = (onset.x - p0.x) / length;
+                    outer_origin[num_ribs] = p0 + (p1 - p0) * t;
+                    inner_origin[num_ribs] = q0 + (q1 - q0) * t;
+                    num_ribs += 1;
+                }
+                if p0.x <= corner.x && p1.x >= corner.x {
+                    let t = (corner.x - p0.x) / length;
+                    outer_origin[num_ribs] = p0 + (p1 - p0) * t;
+                    inner_origin[num_ribs] = q0 + (q1 - q0) * t;
+                    num_ribs += 1;
+                }
+                if p1.x > onset.x {
+                    outer_origin[num_ribs] = p1;
+                    inner_origin[num_ribs] = q1;
+                    num_ribs += 1;
+                }
+            }
+            let num_fixed = num_ribs;
+            let mut num_div = [1usize; 32];
+            while num_ribs < NUM_LIP_RIBS {
+                let mut k = usize::MAX;
+                let mut max_length = -1_000_000.0;
+                for i in 0..num_fixed.saturating_sub(1) {
+                    let length = (outer_origin[i + 1].z - outer_origin[i].z) / num_div[i] as f64;
+                    if length > max_length { max_length = length; k = i; }
+                }
+                num_div[k] += 1;
+                num_ribs += 1;
+            }
+            let mut temp_outer = [P3::default(); 32];
+            let mut temp_inner = [P3::default(); 32];
+            num_ribs = 0;
+            for i in 0..num_fixed {
+                if i < num_fixed - 1 {
+                    let (p0, p1) = (outer_origin[i], outer_origin[i + 1]);
+                    let (q0, q1) = (inner_origin[i], inner_origin[i + 1]);
+                    for k in 0..num_div[i] {
+                        let t = k as f64 / num_div[i] as f64;
+                        temp_outer[num_ribs] = p0 + (p1 - p0) * t;
+                        temp_inner[num_ribs] = q0 + (q1 - q0) * t;
+                        num_ribs += 1;
+                    }
+                } else {
+                    temp_outer[num_ribs] = outer_origin[i];
+                    temp_inner[num_ribs] = inner_origin[i];
+                    num_ribs += 1;
+                }
+            }
+            outer_origin[..num_ribs].copy_from_slice(&temp_outer[..num_ribs]);
+            inner_origin[..num_ribs].copy_from_slice(&temp_inner[..num_ribs]);
+
+            let path = if upper { &mut upper_path } else { &mut lower_path };
+            let max_x = path.get_point(1.0).x;
+            let target = if upper { si::UPPER_LIP } else { si::LOWER_LIP };
+            for i in 0..num_ribs {
+                let p0 = outer_origin[i];
+                let t = i as f64 / (num_ribs - 1) as f64;
+                let p1 = path.get_point(t);
+                let mut q = p1;
+                q.y = p0.y;
+                q = q * (1.0 - 0.7) + p1 * 0.7;
+                let mut r = p0;
+                r.y = p1.y;
+                r = r * (1.0 - 0.0) + p1 * 0.0;
+                let t = (p0.x - outer_origin[0].x) / (outer_origin[NUM_LIP_RIBS - 1].x - outer_origin[0].x);
+                let t = t * t * t;
+                let c1 = q * (1.0 - t) + r * t;
+                curve.set_points_weighted(&[p0, c1, p1], &[1.0, 2.0, 1.0]);
+                self.surface[target].set_vertex(i, 0, inner_origin[i]);
+                for k in 0..NUM_INNER_LIP_POINTS - 1 {
+                    let t = k as f64 / (NUM_INNER_LIP_POINTS - 2) as f64;
+                    let pt = curve.get_point(t);
+                    self.surface[target].set_vertex(i, k + 1, pt);
+                }
+                let mut q = p1;
+                let mut radius = lip_radius * (q.x - corner.x) / (max_x - corner.x);
+                if radius < 0.0 { radius = 0.0; }
+                if upper { q.y += radius; } else { q.y -= radius; }
+                for k in 0..NUM_OUTER_LIP_POINTS {
+                    let t = if upper {
+                        -0.5 * PI + 0.5 * PI * (k + 1) as f64 / NUM_OUTER_LIP_POINTS as f64
+                    } else {
+                        0.5 * PI - 0.5 * PI * (k + 1) as f64 / NUM_OUTER_LIP_POINTS as f64
+                    };
+                    let r = p3(q.x + radius * t.cos(), q.y + radius * t.sin(), q.z);
+                    self.surface[target].set_vertex(i, NUM_INNER_LIP_POINTS + k, r);
+                }
+            }
+        }
+        self.calc_radiation(corner);
+    }
+
+    /// Surface in front of the mouth that models the radiation (a half cylinder-like shape).
+    fn calc_radiation(&mut self, lip_corner: P3) {
+        let lip_point = NUM_INNER_LIP_POINTS;
+        let mut h = 0.0;
+        let mut x = [0.0; NUM_RADIATION_POINTS];
+        let mut y = [0.0; NUM_RADIATION_POINTS];
+        let (mut min_z, mut new_z);
+        min_z = 0.0;
+        for i in 0..NUM_RADIATION_POINTS {
+            let angle_rad = -0.5 * PI + PI * i as f64 / (NUM_RADIATION_POINTS - 1) as f64;
+            x[i] = angle_rad.cos();
+            y[i] = 0.5 * angle_rad.sin() + 0.5;
+        }
+        // `l`, `v` and `h` keep their values from the last lip rib for the ribs beyond it.
+        let mut l = P3::default();
+        let mut v = P3::default();
+        let mut n;
+        for i in 0..NUM_RADIATION_RIBS {
+            if i < NUM_LIP_RIBS {
+                n = p3(0.0, 0.0, -1.0);
+                let u = self.surface[si::UPPER_LIP].get_vertex(i, lip_point);
+                l = self.surface[si::LOWER_LIP].get_vertex(i, lip_point);
+                let m = (u + l) * 0.5;
+                v = u - l;
+                h = u.y - l.y;
+                if h <= 0.0 { h = 0.0; }
+                if u.x <= lip_corner.x {
+                    h = 0.0;
+                } else {
+                    new_z = m.z - h;
+                    if new_z > min_z { new_z = min_z; } else { min_z = new_z; }
+                    h = m.z - min_z;
+                }
+            } else {
+                let angle_rad = 0.5 * PI - 0.5 * PI * (i - NUM_LIP_RIBS + 1) as f64 / (NUM_RADIATION_RIBS - NUM_LIP_RIBS) as f64;
+                n = p3(angle_rad.cos(), 0.0, -angle_rad.sin());
+            }
+            for k in 0..NUM_RADIATION_POINTS {
+                let p = l + v * y[k] + n * (x[k] * h);
+                self.surface[si::RADIATION].set_vertex(i, k, p);
+            }
+        }
+    }
+
+    /// The tongue is ported in the next step.
+    fn calc_tongue(&mut self) {}
 
     fn init_surface_grids(&mut self) {
         use si::*;
@@ -531,6 +1179,30 @@ mod tests {
             assert_eq!((vt.surface[k].num_ribs, vt.surface[k].num_rib_points), (*nr, *np), "grid of surface {k}");
             let d = max_diff(&vt.surface[k], v);
             assert!(d < 2e-8, "surface {k} differs from the original by {d}");
+        }
+    }
+
+    #[test]
+    fn dynamic_surfaces_without_the_tongue_match_the_original_for_vowel_a() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let mut vt = VocalTract::from_speaker(&sp);
+        let a = sp.shape("a").unwrap();
+        vt.set_params(&a.params);
+        for i in 0..NUM_PARAMS { vt.restrict_param(i); vt.param[i].limited_x = vt.param[i].x; }
+        vt.calc_surfaces();
+        let reference = reference_surfaces(SURF_A);
+        let checked = [
+            ("UPPER_COVER", si::UPPER_COVER), ("LOWER_COVER", si::LOWER_COVER), ("LOWER_TEETH", si::LOWER_TEETH),
+            ("UPPER_LIP", si::UPPER_LIP), ("LOWER_LIP", si::LOWER_LIP), ("RADIATION", si::RADIATION),
+            ("LEFT_COVER", si::LEFT_COVER), ("RIGHT_COVER", si::RIGHT_COVER),
+            ("UPPER_COVER_TWOSIDE", si::UPPER_COVER_TWOSIDE), ("LOWER_COVER_TWOSIDE", si::LOWER_COVER_TWOSIDE),
+            ("UPPER_TEETH_TWOSIDE", si::UPPER_TEETH_TWOSIDE), ("LOWER_TEETH_TWOSIDE", si::LOWER_TEETH_TWOSIDE),
+            ("UPPER_LIP_TWOSIDE", si::UPPER_LIP_TWOSIDE), ("LOWER_LIP_TWOSIDE", si::LOWER_LIP_TWOSIDE),
+            ("UVULA", si::UVULA), ("UVULA_TWOSIDE", si::UVULA_TWOSIDE),
+        ];
+        for (name, k) in checked {
+            let d = max_diff(&vt.surface[k], &reference[k].3);
+            assert!(d < 2e-7, "{name} differs from the original by {d}");
         }
     }
 
