@@ -274,6 +274,37 @@ impl Circle {
     }
 }
 
+/// Angle of the tangent from the point `h` to the circle (`c`, `r`); `clockwise` selects which
+/// of the two tangents. Returns 0 if `h` is inside the circle.
+pub fn get_circle_tangent(h: P2, c: P2, r: f64, clockwise: bool) -> f64 {
+    let p = h.x - c.x;
+    let q = h.y - c.y;
+    let radikant = p * p + q * q - r * r;
+    if radikant < 0.0 { return 0.0; }
+    let mut n = radikant.sqrt();
+    if clockwise { n = -n; }
+    (p * n + q * r).atan2(p * r - q * n)
+}
+
+/// Angle (on the ellipse parameter) of the tangent from the point `h` to the ellipse centred
+/// on `c` with semi-axes `a` and `b`.
+pub fn get_ellipse_tangent(h: P2, c: P2, a: f64, b: f64, clockwise: bool) -> f64 {
+    let r = c - h;
+    let mut radikant = r.x * r.x * b * b - b * b * a * a + r.y * r.y * a * a;
+    if radikant < 0.0 { radikant = 0.0; }
+    let root = radikant.sqrt();
+    let mut deno = r.x * r.x * b * b + r.y * r.y * a * a;
+    const EPS: f64 = 0.000001;
+    if deno.abs() < EPS { deno = EPS; }
+    let alpha0 = (-b * (r.y * a * a + r.x * root) / deno).atan2(-a * (r.x * b * b - r.y * root) / deno);
+    let alpha1 = (-b * (r.y * a * a - r.x * root) / deno).atan2(-a * (r.x * b * b + r.y * root) / deno);
+    let (cos, sin) = (alpha0.cos(), alpha0.sin());
+    let v1 = c + p2(a * cos, b * sin) - h;
+    let v2 = p2(-a * sin, b * cos);
+    let test = v1.x * v2.x + v1.y * v2.y;
+    if (test >= 0.0 && clockwise) || (test < 0.0 && !clockwise) { alpha1 } else { alpha0 }
+}
+
 pub const NUM_ELLIPSE_PROPS: usize = 33;
 
 /// An ellipse centred on `m`. Note: `get_point` returns points relative to the origin
