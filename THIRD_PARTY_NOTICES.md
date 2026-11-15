@@ -5,7 +5,7 @@
 
 | 出典 | ライセンス | 入手元 | 本リポジトリでの利用範囲 |
 |---|---|---|---|
-| VocalTractLab (VTL) | GPL-3.0 | https://www.vocaltractlab.de/ | 調査済み（`docs/VTL_NOTES.md`）。`crates/core/src/tds.rs` / `tube.rs` は VTL の `TdsModel` / `Tube`（Peter Birkholz, GPL-3.0）の定式化・初期値に基づく Rust 移植（口腔系のみ。ファイル先頭に出典を明記）。LF の基準数値(ε, α)は `lf.rs` のテストで照合に使用（数値のみ）。声道形状（`VocalTract`）・声帯モデルの移植は未着手 |
+| VocalTractLab (VTL) | GPL-3.0 | https://www.vocaltractlab.de/ | 調査済み（`docs/VTL_NOTES.md`）。`crates/core/src/tds.rs` / `tube.rs` は VTL の `TdsModel` / `Tube`（Peter Birkholz, GPL-3.0）の定式化・初期値に基づく Rust 移植（口腔系のみ。ファイル先頭に出典を明記）。LF の基準数値(ε, α)は `lf.rs` のテストで照合に使用（数値のみ）。声道形状は `geom.rs` / `splines.rs` / `surface.rs` / `vocal_tract.rs` に Rust 移植済み（VTL の `Geometry` / `Splines` / `Surface` / `VocalTract` に基づく。全 69 形状の面積関数が VTL のネイティブ出力と一致することをテストで確認）。`glottis.rs` / `iir.rs` / `synth.rs` は `GeometricGlottis` / `IirFilter` / `Synthesizer` の移植 |
 | CHIMERA (chimera-vocal-synth) | MIT, Copyright (c) 2026 Jameson Hodge | https://github.com/jamesondh/chimera-vocal-synth | 調査済み・流用なし（現時点）。声門 `sources/glottis.rs` は LF ではなくパラメトリックな声門面積波形で、流量は気道ネットワーク（ベルヌーイ＋慣性）側で計算する設計。声道・音素計画・ジェスチャ（`airway/`, `phonetics/`, `control/`）は今後の流用候補。 |
 | coi-serviceworker v0.1.7 | MIT | https://github.com/gzuidhof/coi-serviceworker | `web/public/coi-serviceworker.js`（無改変で同梱） |
 | VTL 話者データ `JD3.speaker` | VTL リポジトリ(GPL-3.0)に同梱。データ単体のライセンス表記は無い | https://github.com/TUD-STKS/VocalTractLab-dev (`resources/JD3.speaker`) | `resources/JD3.speaker` に無改変で同梱。話者の解剖データ、19 個の調音パラメータの定義、声道形状 69 個、声帯形状。GPL-3.0 のリポジトリの一部として配布されているため GPL-3.0 として扱う。再配布条件に疑義が出た場合は作者(Peter Birkholz)に確認する |
