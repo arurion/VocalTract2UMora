@@ -8,13 +8,17 @@
 //! - `tract`, `consonant`, `batch` are planned; see roadmap.
 
 pub mod fft;
+pub mod geom;
 pub mod geometry;
 pub mod glottis;
 pub mod iir;
 pub mod lf;
 pub mod oto;
 pub mod speaker;
+pub mod splines;
+pub mod surface;
 pub mod synth;
 pub mod tds;
 pub mod tube;
+pub mod vocal_tract;
 pub mod xml;
