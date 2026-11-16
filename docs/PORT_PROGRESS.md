@@ -38,11 +38,14 @@ g++ -O1 -std=c++17 -D_USE_MATH_DEFINES -w -I$INC dump_surf.cpp $SRC/*.cpp -o dum
 - 完全閉鎖の形状では、`Tube` が面積に下限 1e-4 cm² を課す(`get_tube` で適用)。
 - 交点の探索は、VTL の既定ではタイル分割(`makeFasterIntersections`)だが、全三角形を番号順に調べても同じ結果になる。
 
+## 子音の補間 (consonant.rs)
+母音座標・文脈依存形状 56 通りがネイティブ出力と一致 (`tests/data/vtl_consonant_ctx.txt`、ダンプは `tools/vtl_reference/dump_ctx.cpp`)。
+
 ## 未移植
 鼻腔(19 区間とその結合)、副鼻腔、梨状窩、`GesturalScore`(ジェスチャー列から時系列パラメータ)。
 
 ## 次の作業
 1. 鼻腔(鼻音 /m n ŋ/ とんに必要)
-2. 3 点コーナー母音補間(`speaker` の 19 次元形状の補間、口蓋化の手動上書き)
+2. (済) 3 点コーナー母音補間と手動上書き
 3. 矢状断面の描画とスクラブ(中間配列 `upper_outline` / `lower_outline` / `tongue_outline` / `center_line` / `tube_section` は取得可能)
 4. Wasm への公開(`VocalTract` の API)

@@ -7,6 +7,7 @@
 //! - `oto`       UTAU oto.ini entry model                       (scaffold)
 //! - `tract`, `consonant`, `batch` are planned; see roadmap.
 
+pub mod consonant;
 pub mod fft;
 pub mod geom;
 pub mod geometry;
