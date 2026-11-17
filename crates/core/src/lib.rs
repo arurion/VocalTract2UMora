@@ -10,6 +10,7 @@
 pub mod consonant;
 pub mod fft;
 pub mod geom;
+pub mod gesture;
 pub mod geometry;
 pub mod glottis;
 pub mod iir;
