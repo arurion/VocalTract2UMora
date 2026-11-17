@@ -16,6 +16,7 @@ pub mod glottis;
 pub mod iir;
 pub mod lf;
 pub mod oto;
+pub mod render;
 pub mod speaker;
 pub mod splines;
 pub mod surface;
