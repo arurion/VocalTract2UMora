@@ -13,3 +13,7 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The acoustic simulation is slow without optimisation; keep the tests fast.
+[profile.test]
+opt-level = 2

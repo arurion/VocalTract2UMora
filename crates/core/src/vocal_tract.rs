@@ -958,11 +958,9 @@ impl VocalTract {
             if consider_tongue || (g != si::UVULA && g != si::EPIGLOTTIS) {
                 let s = &mut self.surface[g];
                 s.prepare_intersection(p, v);
-                for i in 0..s.num_triangles() {
-                    if let Some((p0, p1, n)) = s.triangle_intersection(i) {
-                        if cuts.len() < MAX_CUTS && p0.y < MAX_PROFILE_VALUE && p1.y < MAX_PROFILE_VALUE && p1.y > MIN_PROFILE_VALUE {
-                            cuts.push(Cut { p0, p1, n, global: g });
-                        }
+                for (p0, p1, n) in s.cut_triangles() {
+                    if cuts.len() < MAX_CUTS && p0.y < MAX_PROFILE_VALUE && p1.y < MAX_PROFILE_VALUE && p1.y > MIN_PROFILE_VALUE {
+                        cuts.push(Cut { p0, p1, n, global: g });
                     }
                 }
             }
@@ -1113,11 +1111,9 @@ impl VocalTract {
             let mut tongue_surf = [-1i32; N];
             let s = &mut self.surface[si::TONGUE];
             s.prepare_intersection(p, v);
-            for i in 0..s.num_triangles() {
-                if let Some((p0, p1, n)) = s.triangle_intersection(i) {
-                    if n.y >= 0.0 {
-                        Self::insert_lower_profile_line(p0, p1, si::TONGUE, &mut tongue_profile, &mut tongue_surf);
-                    }
+            for (p0, p1, n) in s.cut_triangles() {
+                if n.y >= 0.0 {
+                    Self::insert_lower_profile_line(p0, p1, si::TONGUE, &mut tongue_profile, &mut tongue_surf);
                 }
             }
             for i in 0..N {

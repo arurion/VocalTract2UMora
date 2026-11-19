@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+//! Batch generation of a UTAU voicebank: a recording list is read line by line, every line is
+//! synthesised as one breath, the oto.ini entries follow from the physical events of the
+//! simulation, and everything is bundled into a ZIP archive.
+//!
+//! List format: one recording per line; a line is a run of kana (hiragana or katakana, spaces
+//! allowed) spoken in one breath. Lines starting with `#` and empty lines are ignored.
+//! A line with a single mora gives the usual one-file-per-mora voicebank; a line with many
+//! morae gives a long continuous recording with one oto entry per mora.
+
+use crate::consonant::ConsonantEditor;
+use crate::kana::{romaji, split_morae, to_shift_jis, Mora};
+use crate::mora::{build_sequence, consonant_table, Manner, MoraItem, MoraOptions, MoraTiming};
+use crate::oto::{compute_oto, detect_events, OtoEntry};
+use crate::render::{render_score, wav_bytes, RenderOptions};
+use crate::speaker::Speaker;
+use crate::zip::ZipWriter;
+
+#[derive(Debug, Clone)]
+pub struct BatchOptions {
+    pub mora: MoraOptions,
+    pub sample_rate: f64,
+    /// Target RMS of the steady vowel (full scale = 1), so that all files have the same level.
+    pub target_vowel_rms: f64,
+    pub noise_seed: u64,
+}
+
+impl Default for BatchOptions {
+    fn default() -> Self {
+        BatchOptions { mora: MoraOptions::default(), sample_rate: 44100.0, target_vowel_rms: 0.10, noise_seed: 1 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListLine {
+    /// 1-based line number in the list text.
+    pub line_no: usize,
+    pub text: String,
+    pub morae: Result<Vec<Mora>, String>,
+}
+
+/// Reads a recording list (see the module documentation).
+pub fn parse_list(text: &str) -> Vec<ListLine> {
+    text.lines().enumerate().filter_map(|(i, raw)| {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') { return None; }
+        Some(ListLine { line_no: i + 1, text: t.to_string(), morae: split_morae(t).map_err(|e| e.to_string()) })
+    }).collect()
+}
+
+#[derive(Debug, Clone)]
+pub struct LineResult {
+    pub wav_name: String,
+    pub wav: Vec<u8>,
+    pub entries: Vec<OtoEntry>,
+}
+
+/// File name for a recording: running number and the romaji of the morae (ASCII).
+pub fn wav_file_name(index: usize, morae: &[Mora]) -> String {
+    let mut r: String = morae.iter().map(romaji).collect::<Vec<_>>().join("");
+    r.truncate(40);
+    format!("{:03}_{}.wav", index + 1, r)
+}
+
+/// Renders one recording (a run of morae spoken in one breath) and derives its oto entries.
+pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: &[Mora], opts: &BatchOptions) -> Result<LineResult, String> {
+    let table = consonant_table();
+    let mut items = vec![];
+    for m in morae {
+        let spec = table.iter().find(|c| c.symbol == m.consonant).ok_or_else(|| format!("子音 {} は未対応です", m.consonant))?;
+        if spec.manner == Manner::Nasal { return Err(format!("「{}」は鼻腔が必要です(未対応)", m.kana)); }
+        items.push(MoraItem { consonant: spec.clone(), vowel: m.vowel.to_string(), palatalised: m.palatalised });
+    }
+    if items.is_empty() { return Err("モーラがありません".to_string()); }
+    let (score, slots, total) = build_sequence(&items, &opts.mora);
+    let ropts = RenderOptions { sample_rate: opts.sample_rate, noise_seed: opts.noise_seed + index as u64, ..RenderOptions::default() };
+    let r = render_score(sp, editor, &score, &ropts);
+
+    // Level: the mean steady-vowel RMS of the line is brought to the target.
+    let mut entries = vec![];
+    let mut vowel_rms_sum = 0.0;
+    let mut n = 0.0;
+    let name = wav_file_name(index, morae);
+    for (k, (m, slot)) in morae.iter().zip(&slots).enumerate() {
+        let spec = &items[k].consonant;
+        let timing = MoraTiming { pressure_on: (slot.start - 0.03).max(0.0), consonant_end: slot.consonant_end, total: slot.end };
+        let ev = detect_events(&r, &timing, spec.manner, spec.voiced);
+        vowel_rms_sum += ev.vowel_rms;
+        n += 1.0;
+        if m.kana != "ー" {
+            entries.push(compute_oto(&ev, total).to_entry(&name, &m.kana));
+        }
+    }
+    let mean_rms = (vowel_rms_sum / n).max(1e-9);
+    let peak = r.audio.iter().fold(0.0f64, |a, v| a.max(v.abs())).max(1e-9);
+    let gain = (opts.target_vowel_rms / mean_rms).min(0.95 / peak);
+    let samples: Vec<f64> = r.audio.iter().map(|v| (v * gain).clamp(-1.0, 1.0)).collect();
+    Ok(LineResult { wav_name: name, wav: wav_bytes(&samples, opts.sample_rate as u32), entries })
+}
+
+/// oto.ini text (Shift_JIS bytes). `Err(char)` if an alias has a character that Shift_JIS
+/// (as supported here) cannot represent.
+pub fn oto_ini_bytes(entries: &[OtoEntry]) -> Result<Vec<u8>, char> {
+    let text: String = entries.iter().map(|e| e.to_line() + "\r\n").collect();
+    to_shift_jis(&text)
+}
+
+/// Bundles WAV files, `oto.ini` and `character.txt` into a ZIP archive.
+pub fn voicebank_zip(files: &[(String, Vec<u8>)], oto_ini: &[u8], character_name: &str) -> Vec<u8> {
+    let mut z = ZipWriter::new();
+    for (name, data) in files { z.add(name, data); }
+    z.add("oto.ini", oto_ini);
+    z.add("character.txt", format!("name={character_name}\r\n").as_bytes());
+    z.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JD3: &str = include_str!("../../../resources/JD3.speaker");
+
+    #[test]
+    fn parses_lines_comments_and_errors() {
+        let l = parse_list("# comment\n\nかきくけこ\nさ し\nxyz\nきゃ\n");
+        assert_eq!(l.len(), 4);
+        assert_eq!(l[0].line_no, 3);
+        assert_eq!(l[0].morae.as_ref().unwrap().len(), 5);
+        assert_eq!(l[1].morae.as_ref().unwrap().len(), 2);
+        assert!(l[2].morae.is_err());
+        assert_eq!(l[3].morae.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn file_names_are_ascii_and_numbered() {
+        let m = split_morae("かしゃ").unwrap();
+        assert_eq!(wav_file_name(0, &m), "001_kasha.wav");
+        assert_eq!(wav_file_name(11, &m), "012_kasha.wav");
+    }
+
+    #[test]
+    fn a_continuous_line_gives_one_wav_and_one_oto_entry_per_mora() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let morae = split_morae("かさた").unwrap();
+        let r = render_line(&sp, &ed, 0, &morae, &BatchOptions::default()).unwrap();
+        assert_eq!(&r.wav[0..4], b"RIFF");
+        assert_eq!(r.entries.len(), 3);
+        let total_ms = (r.wav.len() as f64 - 44.0) / 2.0 / 44.1;
+        // The three morae follow one another in time, each with consistent oto values.
+        let starts: Vec<f64> = r.entries.iter().map(|e| e.offset + e.preutterance).collect();
+        assert!(starts.windows(2).all(|w| w[1] > w[0] + 200.0), "note starts {starts:?}");
+        for e in &r.entries {
+            assert!(e.overlap < e.preutterance && e.preutterance < e.consonant, "{e:?}");
+            assert!(e.cutoff < 0.0 && e.offset + e.consonant < total_ms + e.cutoff + 1.0, "{e:?} of {total_ms} ms");
+            assert_eq!(e.wav, "001_kasata.wav");
+        }
+        assert_eq!(r.entries[1].alias, "さ");
+    }
+
+    #[test]
+    fn levels_are_normalised_and_nasals_are_reported() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let o = BatchOptions::default();
+        let loud = render_line(&sp, &ed, 0, &split_morae("あ").unwrap(), &o).unwrap();
+        let peak = |w: &[u8]| w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs()).max().unwrap();
+        assert!(peak(&loud.wav) < 32767);
+        let err = render_line(&sp, &ed, 0, &split_morae("な").unwrap(), &o).unwrap_err();
+        assert!(err.contains("鼻腔"), "{err}");
+    }
+
+    #[test]
+    fn oto_ini_is_shift_jis_and_the_zip_bundles_everything() {
+        let e = OtoEntry { wav: "001_ka.wav".into(), alias: "か".into(), offset: 10.0, consonant: 90.0, cutoff: -100.0, preutterance: 60.0, overlap: 20.0 };
+        let ini = oto_ini_bytes(&[e]).unwrap();
+        assert_eq!(&ini[..11], b"001_ka.wav=");
+        assert_eq!(&ini[11..13], &[0x82, 0xA9]); // か in Shift_JIS
+        let z = voicebank_zip(&[("001_ka.wav".to_string(), vec![1, 2, 3])], &ini, "test");
+        assert_eq!(&z[0..4], b"PK\x03\x04");
+        assert!(z.windows(7).any(|w| w == b"oto.ini"));
+        assert!(z.windows(13).any(|w| w == b"character.txt"));
+    }
+}
