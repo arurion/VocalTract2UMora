@@ -146,6 +146,22 @@ impl Tube {
         pos
     }
 
+    /// Linear interpolation of the supraglottal sections between two tubes (the glottal
+    /// sections stay as they are). Areas and lengths are interpolated; the articulator of the
+    /// nearer tube is used.
+    pub fn interpolate_supraglottal(&mut self, left: &Tube, right: &Tube, ratio: f64) {
+        let ratio1 = 1.0 - ratio;
+        for i in FIRST_PHARYNX..NUM_SECTIONS {
+            let (l, r) = (&left.sections[i], &right.sections[i]);
+            let s = &mut self.sections[i];
+            s.area_cm2 = (ratio1 * l.area_cm2 + ratio * r.area_cm2).max(MIN_AREA_CM2);
+            s.length_cm = ratio1 * l.length_cm + ratio * r.length_cm;
+            s.articulator = if ratio < 0.5 { l.articulator } else { r.articulator };
+        }
+        self.teeth_position_cm = ratio1 * left.teeth_position_cm + ratio * right.teeth_position_cm;
+        self.tongue_tip_side_elevation = ratio1 * left.tongue_tip_side_elevation + ratio * right.tongue_tip_side_elevation;
+    }
+
     /// A uniform supraglottal tube of the given total length and area.
     pub fn set_uniform_supraglottal(&mut self, total_length_cm: f64, area_cm2: f64) {
         let l = vec![total_length_cm / NUM_SUPRAGLOTTAL as f64; NUM_SUPRAGLOTTAL];

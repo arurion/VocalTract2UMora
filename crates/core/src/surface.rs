@@ -32,6 +32,11 @@ pub struct Surface {
     left_line_point: P2,
     right_line_point: P2,
     line_vector: P2,
+    /// For each pair of neighbouring ribs: whether the cutting line may cross it.
+    rib_pair_mixed: Vec<bool>,
+    /// Bounds of the vertices in the xy plane, recomputed lazily after vertices changed.
+    bounds: (f64, f64, f64, f64),
+    bounds_dirty: bool,
 }
 
 impl Surface {
@@ -93,6 +98,7 @@ impl Surface {
     #[inline]
     pub fn set_vertex(&mut self, rib: usize, rib_point: usize, p: P3) {
         self.vertices[rib * self.num_rib_points + rib_point] = p;
+        self.bounds_dirty = true;
     }
 
     #[inline]
@@ -121,6 +127,42 @@ impl Surface {
         let n = p2(-v.y, v.x);
         self.left_line_point = q + n * EPS;
         self.right_line_point = q - n * EPS;
+        let (nr, np) = (self.num_ribs, self.num_rib_points);
+        self.rib_pair_mixed.clear();
+        // A line that misses the bounding rectangle of the whole surface cannot cut it.
+        if self.bounds_dirty {
+            self.bounds = self.bounds_xy();
+            self.bounds_dirty = false;
+        }
+        let (x0, x1, y0, y1) = self.bounds;
+        const MARGIN: f64 = 0.0001;
+        let side = |x: f64, y: f64| (x - q.x) * v.y - (y - q.y) * v.x;
+        let corners = [side(x0 - MARGIN, y0 - MARGIN), side(x1 + MARGIN, y0 - MARGIN), side(x0 - MARGIN, y1 + MARGIN), side(x1 + MARGIN, y1 + MARGIN)];
+        if corners.iter().all(|&c| c > 0.0) || corners.iter().all(|&c| c < 0.0) {
+            self.rib_pair_mixed.resize(nr.saturating_sub(1), false);
+            return;
+        }
+        // Side of every vertex, then which rib pairs can be cut at all.
+        for vi in 0..self.vertices.len() { self.side_of(vi); }
+        for i in 0..nr.saturating_sub(1) {
+            let sides = &self.v_side[i * np..(i + 2) * np];
+            let all_pos = sides.iter().all(|&s| s > 0);
+            let all_neg = sides.iter().all(|&s| s < 0);
+            self.rib_pair_mixed.push(!(all_pos || all_neg));
+        }
+    }
+
+    /// All triangles cut by the prepared plane, in triangle order: (end points of the cut, normal).
+    pub fn cut_triangles(&mut self) -> Vec<(P2, P2, P2)> {
+        let mut out = Vec::new();
+        let per_pair = 2 * self.num_rib_points.saturating_sub(1);
+        for i in 0..self.rib_pair_mixed.len() {
+            if !self.rib_pair_mixed[i] { continue; }
+            for t in i * per_pair..(i + 1) * per_pair {
+                if let Some(r) = self.triangle_intersection(t) { out.push(r); }
+            }
+        }
+        out
     }
 
     fn side_of(&mut self, vi: usize) {
@@ -167,6 +209,14 @@ impl Surface {
     /// Intersection of triangle `index` with the prepared plane: the end points of the cut
     /// segment and the triangle normal in plane coordinates, or `None` if it is not cut.
     pub fn triangle_intersection(&mut self, index: usize) -> Option<(P2, P2, P2)> {
+        // Quick reject: if all three vertices lie strictly on the same side of the cutting line,
+        // none of the edges crosses it (the edge test needs `s0 >= 0 && s1 <= 0` or the reverse).
+        let [a, b, c] = self.tri_vertex[index];
+        self.side_of(a);
+        self.side_of(b);
+        self.side_of(c);
+        let (sa, sb, sc) = (self.v_side[a], self.v_side[b], self.v_side[c]);
+        if (sa > 0 && sb > 0 && sc > 0) || (sa < 0 && sb < 0 && sc < 0) { return None; }
         let [e0, e1, e2] = self.tri_edge[index];
         let mut q = [P2::default(); 3];
         let mut n = 0;
@@ -234,6 +284,17 @@ mod tests {
             }
         }
         assert!((total - 2.0).abs() < 1e-9, "cut length {total}");
+    }
+
+    #[test]
+    fn cut_triangles_equals_testing_every_triangle() {
+        let mut s = flat();
+        for (q, v) in [(p2(1.5, -1.0), p2(0.0, 1.0)), (p2(-1.0, 0.5), p2(1.0, 0.2)), (p2(0.5, 5.0), p2(1.0, -1.0))] {
+            s.prepare_intersection(q, v);
+            let all: Vec<_> = (0..s.num_triangles()).filter_map(|t| s.triangle_intersection(t)).collect();
+            s.prepare_intersection(q, v);
+            assert_eq!(s.cut_triangles(), all);
+        }
     }
 
     #[test]

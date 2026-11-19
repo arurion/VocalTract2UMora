@@ -165,6 +165,12 @@ impl ConsonantEditor {
             let (Some(i), Some(u)) = (corner(&format!("{base}(i)")), corner(&format!("{base}(u)"))) else { continue };
             consonants.push(ConsonantDef { name: base.to_string(), in_a: s.params, in_i: i, in_u: u });
         }
+        // Not part of the VTL speaker file: a bilabial fricative (Japanese ふ) made from the labial
+        // closure by opening the lips a little (LD + 0.14 cm leaves about 0.1-0.2 cm^2).
+        if let Some(base) = consonants.iter().find(|c| c.name == "ll-labial-closure").cloned() {
+            let open = |mut p: Params| { p[LD] += 0.14; p };
+            consonants.push(ConsonantDef { name: "ll-labial-fricative".to_string(), in_a: open(base.in_a), in_i: open(base.in_i), in_u: open(base.in_u) });
+        }
         Some(ConsonantEditor { vowel_a, vowel_i, vowel_u, consonants, overrides: vec![] })
     }
 
