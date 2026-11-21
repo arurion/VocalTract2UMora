@@ -1,5 +1,7 @@
 # VocalTract2UMora
 
+> **作業を引き継ぐ人(Claude を含む)は、まず [docs/HANDOFF.md](docs/HANDOFF.md) を読んでください。**
+
 調音物理モデリング音声合成による UTAU 音源（WAV + oto.ini）自動生成ツール。設計は [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) を参照。
 
 ## 開発
