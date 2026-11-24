@@ -20,6 +20,15 @@ pub const FIRST_MOUTH: usize = FIRST_PHARYNX + NUM_PHARYNX;
 pub const LAST_MOUTH: usize = FIRST_MOUTH + NUM_MOUTH - 1;
 pub const NUM_SECTIONS: usize = NUM_TRACHEA + NUM_GLOTTIS + NUM_SUPRAGLOTTAL;
 
+/// Nasal cavity: 19 sections of 0.6 cm each (VTL `Tube::initNasalCavity`).
+pub const NUM_NOSE: usize = 19;
+pub const DEFAULT_NASAL_CAVITY_LENGTH_CM: f64 = 11.4;
+/// Number of nasal sections whose area is interpolated from the velum opening.
+const NUM_VELUM_COUPLED: usize = 4;
+const NOSE_AREA_CM2: [f64; NUM_NOSE] = [
+    1.63, 2.07, 2.72, 3.59, 4.24, 3.26, 3.04, 3.04, 2.72, 2.5, 2.39, 2.39, 1.85, 0.76, 1.41, 1.74, 1.30, 1.74, 0.76,
+];
+
 pub const MIN_AREA_CM2: f64 = 0.01e-2;
 pub const STANDARD_WALL_MASS: f64 = 2.4;
 pub const STANDARD_WALL_RESISTANCE: f64 = 5000.0;
@@ -61,6 +70,12 @@ pub struct Tube {
     pub aspiration_strength_db: f64,
     /// Elevation of the tongue-tip sides: 1 = fricative-like, 0 = plosive-like, < 0 = lateral.
     pub tongue_tip_side_elevation: f64,
+    /// Nasal cavity sections (first one is at the velum port). Sinuses are not modelled yet.
+    pub nose: Vec<Section>,
+    /// Nasal cavity length (cm); the 0.6 cm section lengths scale with length / 11.4.
+    pub nasal_cavity_length_cm: f64,
+    /// Velum opening area (cm^2) last passed to `set_velum_opening`.
+    pub velum_opening_cm2: f64,
 }
 
 impl Default for Tube {
@@ -89,11 +104,44 @@ impl Default for Tube {
                 articulator: Articulator::Other,
             });
         }
-        Tube { sections, teeth_position_cm: 15.0, aspiration_strength_db: -40.0, tongue_tip_side_elevation: 0.0 }
+        let mut tube = Tube {
+            sections, teeth_position_cm: 15.0, aspiration_strength_db: -40.0, tongue_tip_side_elevation: 0.0,
+            nose: Vec::new(), nasal_cavity_length_cm: 0.0, velum_opening_cm2: 0.0,
+        };
+        tube.init_nasal_cavity(DEFAULT_NASAL_CAVITY_LENGTH_CM);
+        tube.set_velum_opening(0.0);
+        tube
     }
 }
 
 impl Tube {
+    /// (Re)builds the nasal cavity for the given length (VTL `initNasalCavity`): fixed area
+    /// profile, 0.6 cm sections scaled by length / 11.4. Call `set_velum_opening` afterwards.
+    pub fn init_nasal_cavity(&mut self, length_cm: f64) {
+        self.nasal_cavity_length_cm = length_cm;
+        let factor = length_cm / DEFAULT_NASAL_CAVITY_LENGTH_CM;
+        self.nose = (0..NUM_NOSE)
+            .map(|i| Section {
+                area_cm2: NOSE_AREA_CM2[i], length_cm: 0.6 * factor, wall_mass: STANDARD_WALL_MASS,
+                wall_resistance: STANDARD_WALL_RESISTANCE, wall_stiffness: STANDARD_WALL_STIFFNESS,
+                articulator: Articulator::Other,
+            })
+            .collect();
+        self.set_velum_opening(self.velum_opening_cm2);
+    }
+
+    /// Sets the velo-pharyngeal port area (VTL `setVelumOpening`): the first four nasal
+    /// sections are interpolated quadratically from the opening to the area of section 4.
+    pub fn set_velum_opening(&mut self, opening_cm2: f64) {
+        self.velum_opening_cm2 = opening_cm2;
+        let n = NUM_VELUM_COUPLED;
+        let target = NOSE_AREA_CM2[n];
+        for i in 0..n {
+            let a = opening_cm2 + (i * i) as f64 * (target - opening_cm2) / (n * n) as f64;
+            self.nose[i].area_cm2 = a.max(MIN_AREA_CM2);
+        }
+    }
+
     /// Sets both glottal sections to the same area.
     pub fn set_glottis_area(&mut self, area_cm2: f64) {
         for i in [LOWER_GLOTTIS, UPPER_GLOTTIS] {
