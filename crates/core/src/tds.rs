@@ -7,9 +7,10 @@
 //! sparse Cholesky factorisation. This is a port of the formulation used by VocalTractLab's
 //! `TdsModel` (Birkholz et al.): VocalTractLab, (C) Peter Birkholz, GPL-3.0-or-later.
 //!
-//! Subset implemented here: oral chain with lip radiation and turbulence noise sources
-//! (aspiration, fricatives, bursts). Not yet: nasal cavity, sinuses, piriform fossa, radiation
-//! from the skin, transvelar coupling.
+//! Subset implemented here: oral chain with lip radiation, the nasal cavity (branching off at
+//! the last pharynx section, radiating at the nostrils) and turbulence noise sources
+//! (aspiration, fricatives, bursts). Not yet: sinuses, piriform fossa, radiation from the skin,
+//! transvelar coupling.
 
 use crate::tube::*;
 use std::f64::consts::PI;
@@ -158,8 +159,10 @@ pub struct Tds {
     rhs: Vec<f64>,
     fact: Vec<f64>,
     flow: Vec<f64>,
-    row_lists: Vec<Vec<usize>>, // j < i with a structural non-zero at (i, j)
-    col_lists: Vec<Vec<usize>>, // i > k with a structural non-zero at (i, k)
+    /// Elimination order (minimum fill): `perm[k]` is the current eliminated k-th.
+    perm: Vec<usize>,
+    row_lists: Vec<Vec<usize>>, // j < i with a structural non-zero at (i, j), permuted indices
+    col_lists: Vec<Vec<usize>>, // i > k with a structural non-zero at (i, k), permuted indices
     flow_source_amp: f64,
     flow_source_section: Option<usize>,
     pressure_source_amp: f64,
@@ -174,27 +177,63 @@ pub struct Tds {
     rng: u64,
 }
 
-const N: usize = NUM_SECTIONS + 2; // one inflow current per section + two radiation currents
-const RES_CUR: usize = NUM_SECTIONS; // current through the radiation resistance
-const IND_CUR: usize = NUM_SECTIONS + 1; // current through the radiation inductance
+/// Sections of the network: oral chain followed by the nasal cavity.
+const NS: usize = NUM_SECTIONS + NUM_NOSE;
+/// One inflow current per section + two radiation currents each at the mouth and the nostrils.
+const N: usize = NS + 4;
+const RES_CUR: usize = NS; // mouth: current through the radiation resistance
+const IND_CUR: usize = NS + 1; // mouth: current through the radiation inductance
+const NOSE_RES_CUR: usize = NS + 2; // nostrils
+const NOSE_IND_CUR: usize = NS + 3;
+
+/// Greedy minimum-fill elimination order of a symmetric pattern (ties: smaller degree, then
+/// lowest index). For a chordal pattern such as this tree of cliques it finds a perfect order,
+/// i.e. no fill-in; plain minimum degree does not (it can pick a non-simplicial degree-2 vertex
+/// at the branch).
+fn min_fill_order(adj: &[Vec<bool>]) -> Vec<usize> {
+    let n = adj.len();
+    let mut g: Vec<Vec<bool>> = adj.to_vec();
+    let mut alive = vec![true; n];
+    let mut order = Vec::with_capacity(n);
+    for _ in 0..n {
+        let cost = |v: usize| {
+            let nb: Vec<usize> = (0..n).filter(|&u| alive[u] && u != v && g[v][u]).collect();
+            let mut missing = 0;
+            for (x, &a) in nb.iter().enumerate() { for &b in &nb[x + 1..] { if !g[a][b] { missing += 1; } } }
+            (missing, nb.len())
+        };
+        let k = (0..n).filter(|&v| alive[v]).min_by_key(|&v| cost(v)).unwrap();
+        let nb: Vec<usize> = (0..n).filter(|&u| alive[u] && u != k && g[k][u]).collect();
+        for &a in &nb { for &b in &nb { if a != b { g[a][b] = true; } } }
+        alive[k] = false;
+        order.push(k);
+    }
+    order
+}
 
 impl Tds {
     pub fn new(tube: &Tube, sample_rate: f64) -> Tds {
         assert_eq!(tube.sections.len(), NUM_SECTIONS);
-        let mut sec = vec![Sec::default(); NUM_SECTIONS];
+        assert_eq!(tube.nose.len(), NUM_NOSE);
+        let mut sec = vec![Sec::default(); NS];
         for (i, s) in sec.iter_mut().enumerate() {
             s.cur_in = Some(i);
-            s.cur_out = [if i + 1 < NUM_SECTIONS { Some(i + 1) } else { Some(RES_CUR) }, None];
+            s.cur_out = [if i + 1 < NS { Some(i + 1) } else { None }, None];
         }
-        sec[NUM_SECTIONS - 1].cur_out = [Some(RES_CUR), Some(IND_CUR)];
+        // The oral chain ends at the lips, the nasal chain at the nostrils; the last pharynx
+        // section feeds both (first output: mouth, second: nose, as in VTL).
+        sec[LAST_MOUTH].cur_out = [Some(RES_CUR), Some(IND_CUR)];
+        sec[LAST_NOSE].cur_out = [Some(NOSE_RES_CUR), Some(NOSE_IND_CUR)];
+        sec[LAST_PHARYNX].cur_out = [Some(FIRST_MOUTH), Some(FIRST_NOSE)];
 
         let mut cur = vec![Cur::default(); N];
-        for (i, c) in cur.iter_mut().enumerate().take(NUM_SECTIONS) {
-            c.source = if i == 0 { None } else { Some(i - 1) };
+        for (i, c) in cur.iter_mut().enumerate().take(NS) {
+            c.source = if i == 0 { None } else if i == FIRST_NOSE { Some(LAST_PHARYNX) } else { Some(i - 1) };
             c.target = Some(i);
         }
-        cur[RES_CUR] = Cur { source: Some(NUM_SECTIONS - 1), target: None, ..Cur::default() };
-        cur[IND_CUR] = Cur { source: Some(NUM_SECTIONS - 1), target: None, ..Cur::default() };
+        for (i, src) in [(RES_CUR, LAST_MOUTH), (IND_CUR, LAST_MOUTH), (NOSE_RES_CUR, LAST_NOSE), (NOSE_IND_CUR, LAST_NOSE)] {
+            cur[i] = Cur { source: Some(src), target: None, ..Cur::default() };
+        }
 
         // Symbolic pattern: all currents touching one section node form a clique.
         let mut adj = vec![vec![false; N]; N];
@@ -203,18 +242,23 @@ impl Tds {
             ids.sort_unstable();
             for &a in &ids { for &b in &ids { if a != b { adj[a][b] = true; } } }
         }
-        // Symbolic elimination in natural order (adds fill-in; none for this tree-like network).
+        let perm = min_fill_order(&adj);
+        let mut inv = vec![0usize; N];
+        for (k, &v) in perm.iter().enumerate() { inv[v] = k; }
+        let mut padj = vec![vec![false; N]; N];
+        for a in 0..N { for b in 0..N { if adj[a][b] { padj[inv[a]][inv[b]] = true; } } }
+        // Symbolic elimination in the chosen order (adds fill-in; none for this tree-like network).
         for k in 0..N {
-            let higher: Vec<usize> = (k + 1..N).filter(|&j| adj[k][j]).collect();
-            for &a in &higher { for &b in &higher { if a != b { adj[a][b] = true; } } }
+            let higher: Vec<usize> = (k + 1..N).filter(|&j| padj[k][j]).collect();
+            for &a in &higher { for &b in &higher { if a != b { padj[a][b] = true; } } }
         }
-        let row_lists: Vec<Vec<usize>> = (0..N).map(|i| (0..i).filter(|&j| adj[i][j]).collect()).collect();
-        let col_lists: Vec<Vec<usize>> = (0..N).map(|k| (k + 1..N).filter(|&i| adj[i][k]).collect()).collect();
+        let row_lists: Vec<Vec<usize>> = (0..N).map(|i| (0..i).filter(|&j| padj[i][j]).collect()).collect();
+        let col_lists: Vec<Vec<usize>> = (0..N).map(|k| (k + 1..N).filter(|&i| padj[i][k]).collect()).collect();
 
         let mut t = Tds {
             dt: 1.0 / sample_rate, sec, cur,
             matrix: vec![0.0; N * N], rhs: vec![0.0; N], fact: vec![0.0; N * N], flow: vec![0.0; N],
-            row_lists, col_lists,
+            perm, row_lists, col_lists,
             flow_source_amp: 0.0, flow_source_section: None,
             pressure_source_amp: 0.0, pressure_source_section: None,
             generate_noise: true, lips_dipole: NoiseSource::default(),
@@ -233,6 +277,16 @@ impl Tds {
         self.tongue_tip_elevation = tube.tongue_tip_side_elevation;
         for (i, (s, t)) in self.sec.iter_mut().zip(&tube.sections).enumerate() {
             s.pos = pos[i];
+            s.articulator = t.articulator;
+            s.area = t.area_cm2.max(MIN_AREA_CM2);
+            s.length = t.length_cm;
+            s.volume = s.area * s.length;
+            s.mw = t.wall_mass;
+            s.bw = t.wall_resistance;
+            s.kw = t.wall_stiffness;
+        }
+        for (k, t) in tube.nose.iter().enumerate() {
+            let s = &mut self.sec[FIRST_NOSE + k];
             s.articulator = t.articulator;
             s.area = t.area_cm2.max(MIN_AREA_CM2);
             s.length = t.length_cm;
@@ -290,8 +344,11 @@ impl Tds {
         self.solve();
         self.update();
         self.position += 1;
-        self.cur[RES_CUR].mag + self.cur[IND_CUR].mag
+        self.cur[RES_CUR].mag + self.cur[IND_CUR].mag + self.cur[NOSE_RES_CUR].mag + self.cur[NOSE_IND_CUR].mag
     }
+
+    /// Volume velocity radiated from the nostrils at the last step (cm^3/s).
+    pub fn nostril_flow(&self) -> f64 { self.cur[NOSE_RES_CUR].mag + self.cur[NOSE_IND_CUR].mag }
 
     pub fn section_pressure(&self, i: usize) -> f64 { self.sec[i].pressure }
     pub fn section_flow_in(&self, i: usize) -> f64 { self.cur[i].mag }
@@ -318,7 +375,7 @@ impl Tds {
             let _ = circ;
         }
         // Soft walls (not for the glottal sections).
-        for i in 0..NUM_SECTIONS {
+        for i in 0..NS {
             if i == LOWER_GLOTTIS || i == UPPER_GLOTTIS { continue; }
             let s = &mut self.sec[i];
             let surface = (2.0 * (s.area * PI).sqrt() * s.length).max(MIN_AREA_CM2);
@@ -334,7 +391,10 @@ impl Tds {
         }
         // Turbulence losses: Bernoulli resistance when the flow goes from a wide into a narrow
         // section; the kinetic pressure is lost completely on expansion.
-        for i in (FIRST_PHARYNX + 1)..=LAST_MOUTH {
+        // Only where the previous section has a single outflow: the first mouth and nose
+        // sections just after the branch are excluded (as in VTL).
+        for i in ((FIRST_PHARYNX + 1)..=LAST_MOUTH).chain((FIRST_NOSE + 1)..=LAST_NOSE) {
+            if self.sec[i - 1].cur_out[1].is_some() { continue; }
             let u = self.cur[i].mag;
             let (a_prev, a_cur) = (self.sec[i - 1].area, self.sec[i].area);
             if (a_cur < a_prev && u > 0.0) || (a_cur > a_prev && u < 0.0) {
@@ -549,14 +609,16 @@ impl Tds {
             match tgt {
                 None => {
                     // Radiation into free space: a resistance and an inductance in parallel.
+                    // (The lips noise dipole enters the nostril rows too, as in VTL.)
                     let a = &self.sec[src.unwrap()];
-                    let (u_r, u_l) = (self.cur[RES_CUR].mag, self.cur[IND_CUR].mag);
-                    let (ur_rate, ul_rate) = (self.cur[RES_CUR].rate, self.cur[IND_CUR].rate);
+                    let (res, ind) = (a.cur_out[0].unwrap(), a.cur_out[1].unwrap());
+                    let (u_r, u_l) = (self.cur[res].mag, self.cur[ind].mag);
+                    let (ur_rate, ul_rate) = (self.cur[res].rate, self.cur[ind].rate);
                     let (l_a, r_a) = (a.l, a.r[1]);
                     let r_rad = (128.0 * AMBIENT_DENSITY * SOUND_VELOCITY) / (9.0 * PI * PI * a.area);
                     let l_rad = (8.0 * AMBIENT_DENSITY) / (3.0 * PI * (a.area * PI).sqrt());
                     let (f, g, h);
-                    if i == RES_CUR {
+                    if i == res {
                         f = l_a / dtt + r_a + r_rad;
                         g = l_a / dtt + r_a;
                         h = -(l_a / dtt) * (u_r + u_l) - l_a * (THETA1 / THETA) * (ur_rate + ul_rate);
@@ -568,8 +630,8 @@ impl Tds {
                     }
                     let (e, d, cin) = (a.e, a.d, a.cur_in);
                     if let Some(ci) = cin { self.matrix[i * N + ci] = e; }
-                    self.matrix[i * N + RES_CUR] = -e - f;
-                    self.matrix[i * N + IND_CUR] = -e - g;
+                    self.matrix[i * N + res] = -e - f;
+                    self.matrix[i * N + ind] = -e - g;
                     self.rhs[i] = h - self.lips_dipole.sample - d;
                 }
                 Some(t) => {
@@ -577,19 +639,30 @@ impl Tds {
                     let (l_b, r_b) = (b.l, b.r[0]);
                     let (mut l_a, mut r_a, mut e_a, mut d_a) = (0.0, 0.0, 0.0, 0.0);
                     let mut a_in = None;
+                    // The other current leaving the source section, if it branches.
+                    let mut branch = None;
                     if let Some(s) = src {
                         let a = &self.sec[s];
                         l_a = a.l; r_a = a.r[1]; e_a = a.e; d_a = a.d; a_in = a.cur_in;
+                        branch = if a.cur_out[0] == Some(i) { a.cur_out[1] } else { a.cur_out[0] };
                     }
                     let (l_ab, r_ab) = (l_a + l_b, r_a + r_b);
                     let mut s_amp = 0.0;
                     s_amp -= b.dipole.sample;
                     if Some(t) == self.pressure_source_section { s_amp -= self.pressure_source_amp; }
                     let (u, u_rate) = (self.cur[i].mag, self.cur[i].rate);
-                    let g = l_ab / dtt + r_ab;
-                    let h = -u_rate * l_ab * (THETA1 / THETA) - (l_ab * u) / dtt + s_amp;
+                    let f = l_ab / dtt + r_ab;
+                    let mut h = -u_rate * l_ab * (THETA1 / THETA) - (l_ab * u) / dtt + s_amp;
+                    if let Some(o) = branch {
+                        // Both branches share the half-section of the source: its inductance and
+                        // resistance see the sum of the two currents.
+                        let g = l_a / dtt + r_a;
+                        let (u_d, u_d_rate) = (self.cur[o].mag, self.cur[o].rate);
+                        h -= (l_a * u_d) / dtt + (THETA1 / THETA) * (l_a * u_d_rate);
+                        self.matrix[i * N + o] = -e_a - g;
+                    }
                     if let Some(ci) = a_in { self.matrix[i * N + ci] = e_a; }
-                    self.matrix[i * N + i] = -b.e - g - e_a;
+                    self.matrix[i * N + i] = -b.e - f - e_a;
                     for o in b.cur_out.iter().flatten() { self.matrix[i * N + *o] = b.e; }
                     self.rhs[i] = h + b.d - d_a;
                 }
@@ -597,12 +670,14 @@ impl Tds {
         }
     }
 
-    /// Solves A x = b with A = -matrix (symmetric positive definite) by sparse Cholesky.
+    /// Solves A x = b with A = -matrix (symmetric positive definite) by sparse Cholesky, in the
+    /// minimum-fill order (`perm`).
     fn solve(&mut self) {
         let n = N;
         for i in 0..n {
-            self.fact[i * n + i] = -self.matrix[i * n + i];
-            for &j in &self.row_lists[i] { self.fact[i * n + j] = -self.matrix[i * n + j]; }
+            let pi = self.perm[i];
+            self.fact[i * n + i] = -self.matrix[pi * n + pi];
+            for &j in &self.row_lists[i] { self.fact[i * n + j] = -self.matrix[pi * n + self.perm[j]]; }
         }
         for k in 0..n {
             let mut diag = self.fact[k * n + k];
@@ -619,15 +694,17 @@ impl Tds {
         // forward: L y = -rhs
         let mut y = [0.0f64; N];
         for k in 0..n {
-            let mut v = -self.rhs[k];
+            let mut v = -self.rhs[self.perm[k]];
             for &j in &self.row_lists[k] { v -= self.fact[k * n + j] * y[j]; }
             y[k] = v / self.fact[k * n + k];
         }
         // backward: L^T x = y
+        let mut x = [0.0f64; N];
         for k in (0..n).rev() {
             let mut v = y[k];
-            for &i in &self.col_lists[k] { v -= self.fact[i * n + k] * self.flow[i]; }
-            self.flow[k] = v / self.fact[k * n + k];
+            for &i in &self.col_lists[k] { v -= self.fact[i * n + k] * x[i]; }
+            x[k] = v / self.fact[k * n + k];
+            self.flow[self.perm[k]] = x[k];
         }
     }
 
@@ -640,7 +717,7 @@ impl Tds {
             self.cur[i].noise_mag = (1.0 - nf) * self.cur[i].mag + nf * self.cur[i].noise_mag;
             self.cur[i].rate = (self.cur[i].mag - old) / dtt - (THETA1 / THETA) * self.cur[i].rate;
         }
-        for i in 0..NUM_SECTIONS {
+        for i in 0..NS {
             let net = self.cur[i].mag
                 - self.sec[i].cur_out.iter().flatten().map(|&o| self.cur[o].mag).sum::<f64>();
             let s = &mut self.sec[i];
@@ -850,5 +927,65 @@ mod tests {
         let mut flow = 0.0;
         for _ in 0..20000 { flow = tds.step(); }
         assert!(flow.abs() < 1.0, "flow through closed glottis {flow}");
+    }
+
+    fn closed_mouth_tube(velum_cm2: f64) -> Tube {
+        let mut tube = Tube::default();
+        tube.set_glottis_area(0.05);
+        tube.set_uniform_supraglottal(16.9, 4.0);
+        // Complete closure at the lips.
+        for k in (LAST_MOUTH - 1)..=LAST_MOUTH { tube.sections[k].area_cm2 = MIN_AREA_CM2; }
+        tube.set_velum_opening(velum_cm2);
+        tube
+    }
+
+    fn rms_of_output(tube: &Tube) -> (f64, f64) {
+        let mut tds = Tds::new(tube, 44100.0);
+        let mut rng = Rng(0x0BAD_CAFE_1234_5678);
+        let (mut e_all, mut e_nose, mut n) = (0.0, 0.0, 0);
+        for k in 0..20000 {
+            tds.set_flow_source(100.0 * rng.next(), FIRST_PHARYNX);
+            let y = tds.step();
+            if k >= 4000 { e_all += y * y; e_nose += tds.nostril_flow().powi(2); n += 1; }
+        }
+        ((e_all / n as f64).sqrt(), (e_nose / n as f64).sqrt())
+    }
+
+    #[test]
+    fn elimination_order_adds_no_fill_in() {
+        let tds = Tds::new(&Tube::default(), 44100.0);
+        // Structural off-diagonal pairs of the symmetric pattern: every section clique.
+        let mut edges = std::collections::HashSet::new();
+        for s in &tds.sec {
+            let ids: Vec<usize> = s.cur_in.into_iter().chain(s.cur_out.iter().flatten().copied()).collect();
+            for &a in &ids { for &b in &ids { if a < b { edges.insert((a, b)); } } }
+        }
+        let stored: usize = tds.row_lists.iter().map(|r| r.len()).sum();
+        assert_eq!(stored, edges.len(), "the Cholesky factor has fill-in");
+        assert_eq!(tds.perm.len(), N);
+    }
+
+    #[test]
+    fn nasal_murmur_radiates_through_the_nose_only() {
+        let closed = rms_of_output(&closed_mouth_tube(0.0));
+        let open = rms_of_output(&closed_mouth_tube(1.0));
+        println!("velum closed: {closed:?}, open: {open:?}");
+        assert!(open.1 > 20.0 * closed.1.max(1e-9), "nostril flow with open velum {} vs closed {}", open.1, closed.1);
+        assert!((open.0 - open.1).abs() < 1e-6 * open.0.max(1.0) + 0.05 * open.0, "with a closed mouth the output is nasal");
+        let p = transfer_peaks(&closed_mouth_tube(1.0));
+        println!("nasal peaks: {p:?}");
+        assert!(!p.is_empty() && p[0] < 450.0, "lowest nasal resonance {:?}", p.first());
+    }
+
+    #[test]
+    fn open_velum_adds_nasal_flow_to_a_vowel() {
+        let mut vowel = Tube::default();
+        vowel.set_glottis_area(0.05);
+        vowel.set_uniform_supraglottal(16.9, 4.0);
+        let oral = rms_of_output(&vowel);
+        vowel.set_velum_opening(0.5);
+        let nasalised = rms_of_output(&vowel);
+        println!("oral {oral:?}, nasalised {nasalised:?}");
+        assert!(nasalised.1 > 10.0 * oral.1.max(1e-9));
     }
 }

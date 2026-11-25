@@ -19,6 +19,11 @@ pub const FIRST_PHARYNX: usize = NUM_TRACHEA + NUM_GLOTTIS;
 pub const FIRST_MOUTH: usize = FIRST_PHARYNX + NUM_PHARYNX;
 pub const LAST_MOUTH: usize = FIRST_MOUTH + NUM_MOUTH - 1;
 pub const NUM_SECTIONS: usize = NUM_TRACHEA + NUM_GLOTTIS + NUM_SUPRAGLOTTAL;
+/// Last pharynx section: the nasal cavity branches off here (as in VTL).
+pub const LAST_PHARYNX: usize = FIRST_MOUTH - 1;
+/// Index of the nasal sections in the acoustic simulation (after the oral chain).
+pub const FIRST_NOSE: usize = NUM_SECTIONS;
+pub const LAST_NOSE: usize = NUM_SECTIONS + NUM_NOSE - 1;
 
 /// Nasal cavity: 19 sections of 0.6 cm each (VTL `Tube::initNasalCavity`).
 pub const NUM_NOSE: usize = 19;
@@ -206,6 +211,7 @@ impl Tube {
             s.length_cm = ratio1 * l.length_cm + ratio * r.length_cm;
             s.articulator = if ratio < 0.5 { l.articulator } else { r.articulator };
         }
+        self.set_velum_opening(ratio1 * left.velum_opening_cm2 + ratio * right.velum_opening_cm2);
         self.teeth_position_cm = ratio1 * left.teeth_position_cm + ratio * right.teeth_position_cm;
         self.tongue_tip_side_elevation = ratio1 * left.tongue_tip_side_elevation + ratio * right.tongue_tip_side_elevation;
     }
