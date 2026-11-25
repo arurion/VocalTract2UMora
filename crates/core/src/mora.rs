@@ -88,7 +88,22 @@ pub fn consonant_table() -> Vec<ConsonantSpec> {
     v.push(y);
     v.push(w);
     v.push(c("", None, true, &[]));
+    // Moraic nasal realised as a nasalised vowel (no closure; the velum is open). The closing
+    // variants (n m ng) are the consonants above, used without a vowel.
+    v.push(c("N", Nasal, true, &[]));
     v
+}
+
+/// Which nasal a moraic ん is, from the consonant symbol of the next mora (`None`: end of the
+/// line). It assimilates in place: m before bilabials, ng before velars, n before alveolars,
+/// and a nasalised vowel `N` before vowels, fricatives (s sh h f), glides and at the end.
+pub fn moraic_nasal_symbol(next: Option<&str>) -> &'static str {
+    match next {
+        Some("m" | "p" | "b") => "m",
+        Some("k" | "g" | "ng") => "ng",
+        Some("n" | "t" | "d" | "ch" | "ts" | "j" | "z" | "r") => "n",
+        _ => "N",
+    }
 }
 
 /// Key moments of a mora score (seconds), known from the construction.
@@ -113,11 +128,13 @@ pub struct MoraOptions {
     pub lead_s: f64,
     /// Palatalised mora (きゃ ...): the consonant is formed in the context of /i/.
     pub palatalised: bool,
+    /// Duration of a moraic nasal ん (s): the nasal is held for the whole mora, without a vowel.
+    pub moraic_nasal_s: f64,
 }
 
 impl Default for MoraOptions {
     fn default() -> Self {
-        MoraOptions { f0_hz: 120.0, pressure_dpa: 8000.0, vowel_hold_s: 0.40, lead_s: 0.05, palatalised: false }
+        MoraOptions { f0_hz: 120.0, pressure_dpa: 8000.0, vowel_hold_s: 0.40, lead_s: 0.05, palatalised: false, moraic_nasal_s: 0.20 }
     }
 }
 
@@ -134,6 +151,9 @@ pub struct MoraItem {
     /// "a", "i", "u", "e" or "o".
     pub vowel: String,
     pub palatalised: bool,
+    /// Moraic nasal ん: `consonant` is held for the whole mora (`MoraOptions::moraic_nasal_s`)
+    /// and `vowel` is only the context (the previous vowel), no vowel is spoken after it.
+    pub moraic: bool,
 }
 
 /// Where a mora lies in a sequence (seconds from the start of the file).
@@ -181,9 +201,9 @@ pub fn build_sequence(items: &[MoraItem], opts: &MoraOptions) -> (GestureScore, 
     let mut slots = vec![];
     let mut t = opts.lead_s;
     for it in items {
-        let (hold, _) = consonant_timing(it.consonant.manner);
-        slots.push(Slot { start: t, consonant_end: t + hold, end: t + hold + opts.vowel_hold_s });
-        t += hold + opts.vowel_hold_s;
+        let (hold, vowel_hold) = if it.moraic { (opts.moraic_nasal_s, 0.0) } else { (consonant_timing(it.consonant.manner).0, opts.vowel_hold_s) };
+        slots.push(Slot { start: t, consonant_end: t + hold, end: t + hold + vowel_hold });
+        t += hold + vowel_hold;
     }
     let total = t + TAIL_S;
 
@@ -276,7 +296,7 @@ pub fn build_sequence(items: &[MoraItem], opts: &MoraOptions) -> (GestureScore, 
 
 /// Builds the score for one mora `consonant` + `vowel` ("a", "i", "u", "e", "o").
 pub fn build_mora(spec: &ConsonantSpec, vowel: &str, opts: &MoraOptions) -> (GestureScore, MoraTiming) {
-    let item = MoraItem { consonant: spec.clone(), vowel: vowel.to_string(), palatalised: opts.palatalised };
+    let item = MoraItem { consonant: spec.clone(), vowel: vowel.to_string(), palatalised: opts.palatalised, moraic: false };
     let (score, slots, total) = build_sequence(&[item], opts);
     (score, MoraTiming { pressure_on: opts.lead_s, consonant_end: slots[0].consonant_end, total })
 }
@@ -321,7 +341,7 @@ mod tests {
     #[test]
     fn a_sequence_places_the_morae_one_after_another() {
         let t = consonant_table();
-        let mk = |c: &str, v: &str| MoraItem { consonant: t.iter().find(|x| x.symbol == c).unwrap().clone(), vowel: v.to_string(), palatalised: false };
+        let mk = |c: &str, v: &str| MoraItem { consonant: t.iter().find(|x| x.symbol == c).unwrap().clone(), vowel: v.to_string(), palatalised: false, moraic: false };
         let items = [mk("k", "a"), mk("s", "i"), mk("", "u")];
         let opts = MoraOptions::default();
         let (s, slots, total) = build_sequence(&items, &opts);

@@ -10,8 +10,8 @@
 
 use crate::consonant::ConsonantEditor;
 use crate::kana::{romaji, split_morae, to_shift_jis, Mora};
-use crate::mora::{build_sequence, consonant_table, MoraItem, MoraOptions, MoraTiming};
-use crate::oto::{compute_oto, detect_events, OtoEntry};
+use crate::mora::{build_sequence, consonant_table, moraic_nasal_symbol, MoraItem, MoraOptions, MoraTiming};
+use crate::oto::{compute_oto, compute_oto_steady, detect_events, detect_moraic_nasal, OtoEntry};
 use crate::render::{render_score, wav_bytes, RenderOptions};
 use crate::speaker::Speaker;
 use crate::zip::ZipWriter;
@@ -66,9 +66,12 @@ pub fn wav_file_name(index: usize, morae: &[Mora]) -> String {
 pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: &[Mora], opts: &BatchOptions) -> Result<LineResult, String> {
     let table = consonant_table();
     let mut items = vec![];
-    for m in morae {
-        let spec = table.iter().find(|c| c.symbol == m.consonant).ok_or_else(|| format!("子音 {} は未対応です", m.consonant))?;
-        items.push(MoraItem { consonant: spec.clone(), vowel: m.vowel.to_string(), palatalised: m.palatalised });
+    for (k, m) in morae.iter().enumerate() {
+        // A moraic nasal ん takes its articulation from the next mora.
+        let moraic = m.consonant == "N";
+        let symbol = if moraic { moraic_nasal_symbol(morae.get(k + 1).map(|n| n.consonant)) } else { m.consonant };
+        let spec = table.iter().find(|c| c.symbol == symbol).ok_or_else(|| format!("子音 {} は未対応です", m.consonant))?;
+        items.push(MoraItem { consonant: spec.clone(), vowel: m.vowel.to_string(), palatalised: m.palatalised, moraic });
     }
     if items.is_empty() { return Err("モーラがありません".to_string()); }
     let (score, slots, total) = build_sequence(&items, &opts.mora);
@@ -82,6 +85,15 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     let name = wav_file_name(index, morae);
     for (k, (m, slot)) in morae.iter().zip(&slots).enumerate() {
         let spec = &items[k].consonant;
+        if items[k].moraic {
+            // ん (n m ng) or ン (nasalised vowel N): a segment of its own, ending with the nasal
+            // so that the next mora is not part of it. Not used for the level of the line.
+            let closing = spec.symbol != "N";
+            let ev = detect_moraic_nasal(&r, slot.start, slot.end, closing);
+            let steady_ms = (slot.end - ev.vowel_onset_s) * 1000.0 - 10.0;
+            entries.push(compute_oto_steady(&ev, total, steady_ms).to_entry(&name, if closing { "ん" } else { "ン" }));
+            continue;
+        }
         let timing = MoraTiming { pressure_on: (slot.start - 0.03).max(0.0), consonant_end: slot.consonant_end, total: slot.end };
         let ev = detect_events(&r, &timing, spec.manner, spec.voiced);
         vowel_rms_sum += ev.vowel_rms;
@@ -179,6 +191,49 @@ mod tests {
         let vowel = rms(at(e.offset + e.consonant + 40.0), at(e.offset + e.consonant + 80.0));
         println!("closure rms {closure:.0}, vowel rms {vowel:.0}");
         assert!(closure > 0.03 * vowel, "no murmur: closure {closure} vs vowel {vowel}");
+    }
+
+    #[test]
+    fn moraic_nasals_assimilate_and_get_their_own_segments() {
+        use crate::mora::moraic_nasal_symbol as sym;
+        assert_eq!(sym(Some("m")), "m");
+        assert_eq!(sym(Some("b")), "m");
+        assert_eq!(sym(Some("k")), "ng");
+        assert_eq!(sym(Some("t")), "n");
+        assert_eq!(sym(Some("")), "N");
+        assert_eq!(sym(Some("s")), "N");
+        assert_eq!(sym(None), "N");
+
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let o = BatchOptions::default();
+        // ん before か (ng), before ま (m), before あ (N) and at the end (N).
+        let line = render_line(&sp, &ed, 0, &split_morae("かんかあんまあんあん").unwrap(), &o).unwrap();
+        println!("{:#?}", line.entries.iter().map(|e| (e.alias.clone(), e.offset.round(), e.preutterance.round(), e.overlap.round(), e.consonant.round(), e.cutoff.round())).collect::<Vec<_>>());
+        let aliases: Vec<&str> = line.entries.iter().map(|e| e.alias.as_str()).collect();
+        assert_eq!(aliases, ["か", "ん", "か", "あ", "ん", "ま", "あ", "ン", "あ", "ン"]);
+        let total_ms = (line.wav.len() as f64 - 44.0) / 2.0 / 44.1;
+        for e in &line.entries {
+            assert!(e.offset >= 0.0 && e.preutterance >= 1.0 && e.overlap >= 0.0 && e.overlap < e.preutterance, "{e:?}");
+            assert!(e.cutoff < 0.0 && e.offset + e.consonant < total_ms + e.cutoff + 1.0, "{e:?} of {total_ms} ms");
+        }
+        // Every ん / ン is audible: its steady part has a level comparable to the vowels.
+        let samples: Vec<f64> = line.wav[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect();
+        let rms = |from_ms: f64, to_ms: f64| {
+            let (a, b) = ((from_ms * 44.1) as usize, ((to_ms * 44.1) as usize).min(samples.len()));
+            (samples[a..b].iter().map(|v| v * v).sum::<f64>() / (b - a) as f64).sqrt()
+        };
+        let vowel_level = rms(line.entries[0].offset + line.entries[0].preutterance + 100.0, line.entries[0].offset + line.entries[0].preutterance + 250.0);
+        for e in line.entries.iter().filter(|e| e.alias == "ん" || e.alias == "ン") {
+            let on = e.offset + e.preutterance;
+            let level = rms(on + 50.0, on + 140.0);
+            println!("{} at {on:.0} ms: level {level:.0} (vowel {vowel_level:.0})", e.alias);
+            assert!(level > 0.15 * vowel_level, "{} is nearly silent: {level} vs {vowel_level}", e.alias);
+        }
+        // The nasal segments end with the nasal: the right blank does not reach the next mora.
+        let nasal = &line.entries[1];
+        let next = &line.entries[2];
+        assert!(total_ms + nasal.cutoff <= next.offset + next.preutterance, "{nasal:?} {next:?}");
     }
 
     #[test]

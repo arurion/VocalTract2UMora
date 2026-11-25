@@ -73,6 +73,15 @@ pub fn split_morae(text: &str) -> Result<Vec<Mora>, KanaError> {
             i += 1;
             continue;
         }
+        if c == 'ん' {
+            // Moraic nasal: it keeps the vowel of the previous mora as its context; how it is
+            // articulated (n, m, ng or nasalised vowel) depends on the next mora (see
+            // `mora::moraic_nasal_symbol`).
+            let prev = out.last().ok_or(KanaError::Dangling(c))?;
+            out.push(Mora { kana: "ん".to_string(), consonant: "N", vowel: prev.vowel, palatalised: false });
+            i += 1;
+            continue;
+        }
         let Some((cons, vowel)) = base(c) else {
             return Err(if "ゃゅょぁぃぅぇぉっん".contains(c) { KanaError::Dangling(c) } else { KanaError::Unsupported(c) });
         };
@@ -94,6 +103,7 @@ pub fn split_morae(text: &str) -> Result<Vec<Mora>, KanaError> {
 /// Romaji of a mora for file names (Hepburn-like, ASCII only).
 pub fn romaji(m: &Mora) -> String {
     if m.kana == "ー" { return "-".to_string(); }
+    if m.consonant == "N" { return "N".to_string(); }
     let c = match m.consonant { "hy" => "h", "ng" => "ng", x => x };
     let pal = if m.palatalised { "y" } else { "" };
     if matches!(m.consonant, "sh" | "ch" | "j") && matches!(m.vowel, "a" | "u" | "o") && m.kana.chars().count() == 2 {
