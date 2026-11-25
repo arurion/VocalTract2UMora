@@ -134,7 +134,7 @@ pub fn detect_events(r: &Rendered, timing: &MoraTiming, manner: Manner, voiced: 
         Manner::Fricative => (audible, timing.consonant_end + 0.01),
         Manner::Glottal => (audible, voice),
         Manner::Glide => (audible, timing.consonant_end + 0.01),
-        Manner::None => (audible, audible + 0.02),
+        Manner::None | Manner::Rest => (audible, audible + 0.02),
     };
     let sound_s = sound_s.max(0.0);
     let vowel_onset_s = vowel_onset_s.max(sound_s + 0.010);

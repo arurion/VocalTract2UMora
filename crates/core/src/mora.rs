@@ -31,6 +31,8 @@ pub enum Manner {
     Nasal,
     /// No consonant (a vowel alone).
     None,
+    /// A rest (`_`): silence, the lung pressure is off.
+    Rest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +93,8 @@ pub fn consonant_table() -> Vec<ConsonantSpec> {
     // Moraic nasal realised as a nasalised vowel (no closure; the velum is open). The closing
     // variants (n m ng) are the consonants above, used without a vowel.
     v.push(c("N", Nasal, true, &[]));
+    v.push(c("v", Fricative, true, &[(Lip, "ll-labial-fricative")]));
+    v.push(c("_", Rest, false, &[]));
     v
 }
 
@@ -130,11 +134,13 @@ pub struct MoraOptions {
     pub palatalised: bool,
     /// Duration of a moraic nasal ん (s): the nasal is held for the whole mora, without a vowel.
     pub moraic_nasal_s: f64,
+    /// Duration of a rest `_` inside a line (s).
+    pub rest_s: f64,
 }
 
 impl Default for MoraOptions {
     fn default() -> Self {
-        MoraOptions { f0_hz: 120.0, pressure_dpa: 8000.0, vowel_hold_s: 0.40, lead_s: 0.05, palatalised: false, moraic_nasal_s: 0.20 }
+        MoraOptions { f0_hz: 120.0, pressure_dpa: 8000.0, vowel_hold_s: 0.40, lead_s: 0.05, palatalised: false, moraic_nasal_s: 0.20, rest_s: 0.30 }
     }
 }
 
@@ -175,6 +181,7 @@ fn consonant_timing(m: Manner) -> (f64, f64) {
         Manner::Glottal => (0.12, 0.11),
         Manner::Nasal => (0.10, 0.0),
         Manner::None => (0.02, 0.0),
+        Manner::Rest => (0.0, 0.0),
     }
 }
 
@@ -201,7 +208,7 @@ pub fn build_sequence(items: &[MoraItem], opts: &MoraOptions) -> (GestureScore, 
     let mut slots = vec![];
     let mut t = opts.lead_s;
     for it in items {
-        let (hold, vowel_hold) = if it.moraic { (opts.moraic_nasal_s, 0.0) } else { (consonant_timing(it.consonant.manner).0, opts.vowel_hold_s) };
+        let (hold, vowel_hold) = if it.consonant.manner == Manner::Rest { (opts.rest_s, 0.0) } else if it.moraic { (opts.moraic_nasal_s, 0.0) } else { (consonant_timing(it.consonant.manner).0, opts.vowel_hold_s) };
         slots.push(Slot { start: t, consonant_end: t + hold, end: t + hold + vowel_hold });
         t += hold + vowel_hold;
     }
@@ -286,11 +293,21 @@ pub fn build_sequence(items: &[MoraItem], opts: &MoraOptions) -> (GestureScore, 
         s.sequences[gt::VOWEL].push(G::shape(total - cursors[gt::VOWEL], &last, TAU_VOWEL));
     }
     s.sequences[gt::F0] = vec![Gesture::value(total, crate::gesture::f0_st(opts.f0_hz), 0.0, 0.03)];
-    s.sequences[gt::PRESSURE] = vec![
-        Gesture::value(opts.lead_s, 0.0, 0.0, 0.005),
-        Gesture::value(total - opts.lead_s - TAIL_S, opts.pressure_dpa, 0.0, 0.005),
-        Gesture::value(TAIL_S, 0.0, 0.0, 0.005),
-    ];
+    // Lung pressure: on throughout, off during the rests.
+    let on = |d: f64| Gesture::value(d, opts.pressure_dpa, 0.0, 0.005);
+    let off = |d: f64| Gesture::value(d, 0.0, 0.0, 0.005);
+    let mut pressure = vec![off(opts.lead_s)];
+    let mut cursor = opts.lead_s;
+    for (it, slot) in items.iter().zip(&slots) {
+        if it.consonant.manner == Manner::Rest {
+            if slot.start > cursor + 1e-12 { pressure.push(on(slot.start - cursor)); }
+            pressure.push(off(slot.end - slot.start));
+            cursor = slot.end;
+        }
+    }
+    if total - TAIL_S > cursor + 1e-12 { pressure.push(on(total - TAIL_S - cursor)); }
+    pressure.push(off(TAIL_S));
+    s.sequences[gt::PRESSURE] = pressure;
     (s, slots, total)
 }
 

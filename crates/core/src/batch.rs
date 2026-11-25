@@ -10,7 +10,7 @@
 
 use crate::consonant::ConsonantEditor;
 use crate::kana::{romaji, split_morae, to_shift_jis, Mora};
-use crate::mora::{build_sequence, consonant_table, moraic_nasal_symbol, MoraItem, MoraOptions, MoraTiming};
+use crate::mora::{build_sequence, consonant_table, moraic_nasal_symbol, Manner, MoraItem, MoraOptions, MoraTiming};
 use crate::oto::{compute_oto, compute_oto_steady, detect_events, detect_moraic_nasal, OtoEntry};
 use crate::render::{render_score, wav_bytes, RenderOptions};
 use crate::speaker::Speaker;
@@ -85,6 +85,7 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     let name = wav_file_name(index, morae);
     for (k, (m, slot)) in morae.iter().zip(&slots).enumerate() {
         let spec = &items[k].consonant;
+        if spec.manner == Manner::Rest { continue; }
         if items[k].moraic {
             // ん (n m ng) or ン (nasalised vowel N): a segment of its own, ending with the nasal
             // so that the next mora is not part of it. Not used for the level of the line.
@@ -234,6 +235,43 @@ mod tests {
         let nasal = &line.entries[1];
         let next = &line.entries[2];
         assert!(total_ms + nasal.cutoff <= next.offset + next.preutterance, "{nasal:?} {next:?}");
+    }
+
+    /// A line of the Kurosu 8-mora structure (one consonant per section, vowels rotated; a
+    /// moraic nasal in the third place), written down after his published description.
+    fn kurosu8_line(c: &str, shift: usize) -> String {
+        let pattern: [Option<usize>; 8] = [Some(0), Some(0), None, Some(1), Some(0), Some(2), Some(0), Some(1)];
+        let row: [[&str; 5]; 4] = [["か", "き", "く", "け", "こ"], ["さ", "すぃ", "す", "せ", "そ"], ["ふぁ", "ふぃ", "ふ", "ふぇ", "ふぉ"], ["ヴぁ", "ヴぃ", "ヴ", "ヴぇ", "ヴぉ"]];
+        let r = match c { "k" => 0, "s" => 1, "f" => 2, _ => 3 };
+        let mut out = String::from("_");
+        for p in pattern { match p { None => out.push('ん'), Some(x) => out.push_str(row[r][(x + shift) % 5]) } }
+        out
+    }
+
+    #[test]
+    fn kurosu_style_lines_with_rests_and_special_kana_render() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let o = BatchOptions::default();
+        for (c, shift) in [("k", 0), ("s", 2), ("f", 0), ("v", 1)] {
+            let text = kurosu8_line(c, shift);
+            let morae = split_morae(&text).unwrap();
+            let t0 = std::time::Instant::now();
+            let r = render_line(&sp, &ed, 0, &morae, &o).unwrap();
+            let secs = (r.wav.len() as f64 - 44.0) / 2.0 / o.sample_rate;
+            println!("{text}: {} morae, {} entries, {secs:.1} s of audio in {:.2} s", morae.len(), r.entries.len(), t0.elapsed().as_secs_f64());
+            assert_eq!(r.entries.len(), morae.len());
+            assert!(r.entries.iter().any(|e| e.alias == "ん" || e.alias == "ン"));
+        }
+        // A rest is silent and is not an oto entry.
+        let line = render_line(&sp, &ed, 0, &split_morae("あ_い").unwrap(), &o).unwrap();
+        assert_eq!(line.entries.iter().map(|e| e.alias.as_str()).collect::<Vec<_>>(), ["あ", "い"]);
+        let samples: Vec<f64> = line.wav[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect();
+        let rms = |a_s: f64, b_s: f64| { let (a, b) = ((a_s * 44100.0) as usize, (b_s * 44100.0) as usize); (samples[a..b].iter().map(|v| v * v).sum::<f64>() / (b - a) as f64).sqrt() };
+        // lead 0.05 + あ (0.02 + 0.40) = 0.47 s; the rest lasts 0.30 s from there.
+        let (vowel, rest) = (rms(0.30, 0.45), rms(0.55, 0.75));
+        println!("vowel rms {vowel:.0}, rest rms {rest:.0}");
+        assert!(rest < 0.05 * vowel, "the rest is not silent: {rest} vs {vowel}");
     }
 
     #[test]
