@@ -6,7 +6,7 @@
 ## 1. いまどこまで出来ているか
 
 目標は「調音物理モデリング音声合成で UTAU 音源 (WAV + oto.ini) を自動生成するブラウザツール」。
-**コア(Rust)は、ほぼ一式が動く。足りないのは (a) 鼻腔、(b) Wasm への公開と UI、(c) 品質の詰め。**
+**コア(Rust)は、ほぼ一式が動く(鼻腔も実装済み)。足りないのは (b) Wasm への公開と UI、(c) 品質の詰め、(d) 「ん」の扱い。**
 
 | 要件 | 状態 |
 |---|---|
@@ -14,7 +14,7 @@
 | ② 話者ジオメトリ(骨格) | UI と JSON 入出力は完成 (web `geometry-view.ts`)。**ただし VocalTract(調音モデル)にはまだ繋がっていない** (§4-d) |
 | ③ 3点コーナー母音補間 | **core 完成** (`consonant.rs`、VTL とネイティブ比較で一致)。**UI なし** |
 | ④ スクラブ・プレビュー | **データは core で取れる** (`render.rs` の `TraceSample` / `GeometryFrame`)。**UI なし** |
-| ⑤ バッチ + oto.ini + ZIP | **core 完成** (`batch.rs` ほか、Python の zipfile/wave/cp932 で検証済み)。**UI・Wasm 公開なし**。鼻音(な・ま・ん)は未対応 |
+| ⑤ バッチ + oto.ini + ZIP | **core 完成** (`batch.rs` ほか、Python の zipfile/wave/cp932 で検証済み)。**UI・Wasm 公開なし**。鼻音(な・ま・ガ行鼻濁音)は対応済み。**「ん」(撥音)は `split_morae` が `Dangling` で拒否する(未設計)** |
 
 テスト: `cargo test -p vt2umora-core` → **98 件パス、約 10 秒**。CI(`.github/workflows/deploy.yml`)は PR でテスト+ビルド、main への push で GitHub Pages にデプロイ。
 
@@ -54,18 +54,13 @@
 
 ## 4. 次にやること (優先順)
 
-### a. 鼻腔の移植 (進行中だった作業。着手前で未コミット)
-な・に・ぬ・ね・の・ま・み・む・め・も・ん が鳴らない(`batch.rs` は「未対応」と報告する)。
-- **形状**: `Tube.cpp` の `initNasalCavity` (171–250 行) と `setVelumOpening` (430–475 行)。鼻腔は **19 区間 × 0.6 cm**(`anatomy.nasal_cavity_length` = 11.4 cm、既定 `DEFAULT_NASAL_CAVITY_LENGTH_CM`=11.4 との比で長さを拡縮)。軟口蓋の開き面積 = `nasal_port_area_cm2`(`vocal_tract.rs` で計算済み)が、**最初の 4 区間の面積を 2 次式で補間**する。`VocalTract::getTube` は `initNasalCavity(anatomy.nasalCavityLength)` と `setVelumOpening(nasalPortArea)` を呼ぶ。
-- **基準データ**: `tests/data/vtl_tubes.txt` の `N i area length` 行(全 69 形状分)が鼻腔の面積と長さ。これと比較するテストを書く。
-- **tube.rs**: `NUM_SECTIONS` は今 65(口腔系のみ)。鼻腔(`FIRST_NOSE=65`, `LAST_NOSE=83`)を足して 84 にする。**影響箇所**: `tube.rs` の `positions()` と `interpolate_supraglottal`、`render.rs` と `synth.rs` の「最小断面積」ループ(`..=LAST_MOUTH` に限定する)、`tds.rs` のループ全般。
-- **tds.rs**(`TdsModel.cpp` の `initModel`、`prepareTimeStep`、`calcMatrix` を読み直すこと):
-  - 咽頭の最後の区間 (`LAST_PHARYNX` = 40) が 2 本の枝電流 (口の先頭 41、鼻の先頭 65) を持つ**分岐**になる。`calcMatrix` には「分岐の電流」の場合分けがある(`branchingOffCurrent`)。**私のメモでは、対角 = −E_B − E_A − F(F = L_AB/(dtθ)+R_AB)、分岐先との係数 = −E_A − G(G = L_A/(dtθ)+R_A)、右辺は (L_AB·uB + L_A·uD) の項**だが、これは記憶ベースなので、**必ず `TdsModel.cpp` 1961–2222 行で確認すること**。
-  - 放射は区間ごとに `currentOut[0]`(抵抗)と `currentOut[1]`(インダクタンス)の対で表す。口(`LAST_MOUTH`)と鼻孔(`LAST_NOSE`)の 2 組。放射流量 = 口 + 鼻孔(+ 皮膚。皮膚は未実装)。
-  - 乱流損失のループは、`FIRST_NOSE+1..=LAST_NOSE` にも同様にある。条件は「前の区間の出力が 1 本だけ」(`cur_out[1]` が None)。分岐直後の口の先頭・鼻の先頭は除外される(口側のループにも同じ条件が必要)。
-  - **コレスキー分解**: 分岐があると自然順の消去でフィルインが増える。**最小次数法で消去順序を決める**(N=88 程度なので初期化時に計算すれば十分)。`solve()` は置換した添字で行列を作り直す。
-  - VTL の既定で有効な「皮膚放射」「梨状窩」「副鼻腔」は未実装(`docs/VTL_NOTES.md` に記載)。副鼻腔・梨状窩は鼻音の反共振に効くので、余力があれば後続で。
-- 完了したら `batch.rs` の鼻音の「未対応」エラーを外し、`mora.rs` の `Nasal` を検証(閉鎖+軟口蓋の開き。ん は語頭ではなく単独の鼻音として別扱いが必要)。
+### a. 鼻腔の移植 (**完了**。PR #16)
+- **形状**: `tube.rs` の `init_nasal_cavity` / `set_velum_opening`(19 区間 × 0.6 cm、軟口蓋の開きから最初の 4 区間を 2 次補間)。`Tube.nose` は `sections` とは別の `Vec`。`vtl_tubes.txt` の `N` 行と全 69 形状で 1e-5 以内で一致(`area_functions_of_all_shapes_match_the_original`)。`interpolate_supraglottal` は軟口蓋開口を線形補間する(VTL と同じ)。
+- **TDS**: `tds.rs` は 84 区間(口腔系 65 + 鼻腔 19)+ 放射電流 4 本 = 88 電流。`LAST_PHARYNX`(40) の出力が [口の先頭 41, 鼻の先頭 65] の分岐。分岐行の式は `TdsModel.cpp` 2137–2169 行と照合済み(対角 −E_B−E_A−F、分岐先 −E_A−G、右辺 L_AB·uB + L_A·uD の項)。放射は口と鼻孔の 2 組で、出力は両者の和(`nostril_flow()` で鼻孔のみ取得可)。乱流損失は「前区間の出力が 1 本だけ」の条件付きで鼻側にも適用。**VTL と同様に唇ダイポール雑音は鼻孔の放射行にも入る**(VTL の癖をそのまま移植)。
+- **消去順序**: コレスキーは**最小フィルイン**順(同点は次数→番号)。単純な最小次数法では分岐で非単体頂点を選んでフィルインが 41 個出たため。テスト `elimination_order_adds_no_fill_in` が 0 を保証する。
+- **検証**: 口を閉じて軟口蓋を 1 cm² 開くと鼻孔のみから出力、最初の共鳴は約 280 Hz(鼻音の第 1 共鳴)。軟口蓋が閉じていれば鼻孔流量はほぼ 0。`batch.rs` の「な・ま」が実際にレンダリングでき、閉鎖区間の鼻音 RMS が母音の約 70%。
+- **未実装(VTL の既定で有効)**: 副鼻腔・梨状窩・皮膚放射・経軟口蓋結合。副鼻腔・梨状窩は鼻音の反共振(アンチフォルマント)に効くので、音質を詰めるなら次。
+- **「ん」**: `split_morae` が単独の「ん」を拒否する。UTAU 上の位置づけ(直前母音の鼻音化、閉鎖の持続、oto の先行発声)を決めてから実装する。
 
 ### b. Wasm API と UI
 `crates/wasm` に公開する: 話者読み込み(`JD3.speaker` を `include_str!` で同梱するか、ユーザーのファイル)、`ConsonantEditor`(基準形状の取得・上書きの設定/削除)、モーラ/スコアのレンダリング(音+トレース+フレーム)、`batch::render_line`、`oto_ini_bytes`、`voicebank_zip`。型付き配列で返すこと。
@@ -110,7 +105,7 @@ PY
 
 ## 6. VTL との意図的な差分・未実装
 
-- 鼻腔・副鼻腔・梨状窩・皮膚放射・経軟口蓋結合: 未実装(鼻腔が最優先)。
+- 副鼻腔・梨状窩・皮膚放射・経軟口蓋結合: 未実装(鼻腔は実装済み)。
 - 弱い雑音源が起動しない VTL の癖(現在振幅を 0 に戻す処理)は直した(息漏れ声のため)。`tds.rs` のコメントと `VTL_NOTES.md` §6。
 - パラメータ曲線はスコアの終わり + 10 ms まで(VTL は残りを中立値で埋める)。
 - 子音形状は `ConsonantEditor` から取るので手動上書きが効く。「ふ」用の `ll-labial-fricative` は VTL の形状ではなく、両唇閉鎖の LD に +0.14 cm したもの(`consonant.rs`)。

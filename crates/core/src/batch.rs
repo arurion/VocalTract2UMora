@@ -10,7 +10,7 @@
 
 use crate::consonant::ConsonantEditor;
 use crate::kana::{romaji, split_morae, to_shift_jis, Mora};
-use crate::mora::{build_sequence, consonant_table, Manner, MoraItem, MoraOptions, MoraTiming};
+use crate::mora::{build_sequence, consonant_table, MoraItem, MoraOptions, MoraTiming};
 use crate::oto::{compute_oto, detect_events, OtoEntry};
 use crate::render::{render_score, wav_bytes, RenderOptions};
 use crate::speaker::Speaker;
@@ -68,7 +68,6 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     let mut items = vec![];
     for m in morae {
         let spec = table.iter().find(|c| c.symbol == m.consonant).ok_or_else(|| format!("子音 {} は未対応です", m.consonant))?;
-        if spec.manner == Manner::Nasal { return Err(format!("「{}」は鼻腔が必要です(未対応)", m.kana)); }
         items.push(MoraItem { consonant: spec.clone(), vowel: m.vowel.to_string(), palatalised: m.palatalised });
     }
     if items.is_empty() { return Err("モーラがありません".to_string()); }
@@ -159,15 +158,27 @@ mod tests {
     }
 
     #[test]
-    fn levels_are_normalised_and_nasals_are_reported() {
+    fn levels_are_normalised_and_nasals_render() {
         let sp = Speaker::from_xml(JD3).unwrap();
         let ed = ConsonantEditor::from_speaker(&sp).unwrap();
         let o = BatchOptions::default();
         let loud = render_line(&sp, &ed, 0, &split_morae("あ").unwrap(), &o).unwrap();
         let peak = |w: &[u8]| w[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]]).unsigned_abs()).max().unwrap();
         assert!(peak(&loud.wav) < 32767);
-        let err = render_line(&sp, &ed, 0, &split_morae("な").unwrap(), &o).unwrap_err();
-        assert!(err.contains("鼻腔"), "{err}");
+        // Nasals need the nasal cavity: the murmur makes the closure clearly audible.
+        let nasal = render_line(&sp, &ed, 0, &split_morae("なま").unwrap(), &o).unwrap();
+        println!("{:#?}", nasal.entries);
+        assert_eq!(nasal.entries.len(), 2);
+        let samples: Vec<f64> = nasal.wav[44..].chunks(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f64).collect();
+        let rms = |a: usize, b: usize| (samples[a..b].iter().map(|v| v * v).sum::<f64>() / (b - a) as f64).sqrt();
+        let e = &nasal.entries[0];
+        let sr = o.sample_rate;
+        let at = |ms: f64| ((ms / 1000.0 * sr) as usize).min(samples.len() - 1);
+        // From the left blank to the end of the consonant part (closure + release) of "な".
+        let closure = rms(at(e.offset + 0.3 * e.preutterance), at(e.offset + e.preutterance - 5.0).max(at(e.offset + 0.3 * e.preutterance) + 10));
+        let vowel = rms(at(e.offset + e.consonant + 40.0), at(e.offset + e.consonant + 80.0));
+        println!("closure rms {closure:.0}, vowel rms {vowel:.0}");
+        assert!(closure > 0.03 * vowel, "no murmur: closure {closure} vs vowel {vowel}");
     }
 
     #[test]

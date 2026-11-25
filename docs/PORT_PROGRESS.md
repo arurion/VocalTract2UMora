@@ -45,7 +45,7 @@ g++ -O1 -std=c++17 -D_USE_MATH_DEFINES -w -I$INC dump_surf.cpp $SRC/*.cpp -o dum
 鼻腔(19 区間とその結合)、副鼻腔、梨状窩、`GesturalScore`(ジェスチャー列から時系列パラメータ)。
 
 ## 次の作業
-1. 鼻腔(鼻音 /m n ŋ/ とんに必要)
+1. ~~鼻腔(鼻音 /m n ŋ/)~~ 完了(PR #16)。残りは副鼻腔・梨状窩・皮膚放射
 2. (済) 3 点コーナー母音補間と手動上書き
 3. 矢状断面の描画とスクラブ(中間配列 `upper_outline` / `lower_outline` / `tongue_outline` / `center_line` / `tube_section` は取得可能)
 4. Wasm への公開(`VocalTract` の API)
