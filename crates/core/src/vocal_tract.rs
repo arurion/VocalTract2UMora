@@ -1719,6 +1719,8 @@ impl VocalTract {
         tube.set_articulators(&tags);
         tube.teeth_position_cm = self.incisor_pos_cm;
         tube.tongue_tip_side_elevation = self.param[TS3].x;
+        tube.init_nasal_cavity(self.anatomy.nasal_cavity_length);
+        tube.set_velum_opening(self.nasal_port_area_cm2);
         tube
     }
 
@@ -2795,6 +2797,7 @@ mod tests {
         incisor: f64,
         tip_elevation: f64,
         sections: Vec<(f64, f64, i32)>, // area, length, articulator
+        nose: Vec<(f64, f64)>,          // area, length
     }
 
     fn reference_tubes(text: &str) -> Vec<RefShape> {
@@ -2802,13 +2805,14 @@ mod tests {
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             match f.first().copied() {
-                Some("SHAPE") => out.push(RefShape { name: f[1].to_string(), incisor: 0.0, tip_elevation: 0.0, sections: vec![] }),
+                Some("SHAPE") => out.push(RefShape { name: f[1].to_string(), incisor: 0.0, tip_elevation: 0.0, sections: vec![], nose: vec![] }),
                 Some("META") => {
                     let r = out.last_mut().unwrap();
                     r.incisor = f[2].parse().unwrap();
                     r.tip_elevation = f[4].parse().unwrap();
                 }
                 Some("S") => out.last_mut().unwrap().sections.push((f[2].parse().unwrap(), f[3].parse().unwrap(), f[4].parse().unwrap())),
+                Some("N") => out.last_mut().unwrap().nose.push((f[2].parse().unwrap(), f[3].parse().unwrap())),
                 _ => {}
             }
         }
@@ -2832,6 +2836,10 @@ mod tests {
                 let t = tube.sections[crate::tube::FIRST_PHARYNX + k];
                 err = err.max((t.area_cm2 - area).abs()).max((t.length_cm - length).abs());
                 if t.articulator as i32 != *art { err = err.max(1.0); }
+            }
+            assert_eq!(r.nose.len(), crate::tube::NUM_NOSE);
+            for (k, (area, length)) in r.nose.iter().enumerate() {
+                err = err.max((tube.nose[k].area_cm2 - area).abs()).max((tube.nose[k].length_cm - length).abs());
             }
             err = err.max((vt.incisor_pos_cm - r.incisor).abs()).max((vt.param[TS3].x - r.tip_elevation).abs());
             if err > worst.0 { worst = (err, r.name.clone()); }

@@ -32,6 +32,7 @@ fn base(c: char) -> Option<(&'static str, &'static str)> {
         'や' => ("y", "a"), 'ゆ' => ("y", "u"), 'よ' => ("y", "o"),
         'ら' => ("r", "a"), 'り' => ("r", "i"), 'る' => ("r", "u"), 'れ' => ("r", "e"), 'ろ' => ("r", "o"),
         'わ' => ("w", "a"), 'を' => ("", "o"),
+        'ゔ' => ("v", "u"),
         _ => return None,
     })
 }
@@ -73,9 +74,44 @@ pub fn split_morae(text: &str) -> Result<Vec<Mora>, KanaError> {
             i += 1;
             continue;
         }
+        if c == '_' {
+            // Rest. A leading one only marks a recording that starts after a pause (the file
+            // starts with silence anyway); repeated or trailing ones add nothing.
+            let next_is_more = chars[i + 1..].iter().any(|n| *n != '_');
+            match out.last() {
+                Some(prev) if prev.kana != "_" && next_is_more => {
+                    out.push(Mora { kana: "_".to_string(), consonant: "_", vowel: prev.vowel, palatalised: false });
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        if c == 'ん' {
+            // Moraic nasal: it keeps the vowel of the previous mora as its context; how it is
+            // articulated (n, m, ng or nasalised vowel) depends on the next mora (see
+            // `mora::moraic_nasal_symbol`).
+            let prev = out.last().ok_or(KanaError::Dangling(c))?;
+            out.push(Mora { kana: "ん".to_string(), consonant: "N", vowel: prev.vowel, palatalised: false });
+            i += 1;
+            continue;
+        }
         let Some((cons, vowel)) = base(c) else {
             return Err(if "ゃゅょぁぃぅぇぉっん".contains(c) { KanaError::Dangling(c) } else { KanaError::Unsupported(c) });
         };
+        // Small vowel after a kana (てぃ とぅ つぁ ふぁ うぃ いぇ きぇ ヴぁ ...): the consonant of
+        // the kana with the vowel of the small kana. う and い become the glides w and y.
+        if let Some(v) = chars.get(i + 1).and_then(|n| match n { 'ぁ' => Some("a"), 'ぃ' => Some("i"), 'ぅ' => Some("u"), 'ぇ' => Some("e"), 'ぉ' => Some("o"), _ => None }) {
+            let (cons2, pal) = match c {
+                'う' => ("w", false),
+                'い' => ("y", false),
+                'あ' | 'え' | 'お' | 'を' => return Err(KanaError::Dangling(chars[i + 1])),
+                _ => (cons, vowel == "i" && v != "i" && !matches!(cons, "sh" | "ch" | "j")),
+            };
+            out.push(Mora { kana: format!("{c}{}", chars[i + 1]), consonant: cons2, vowel: v, palatalised: pal });
+            i += 2;
+            continue;
+        }
         let small = chars.get(i + 1).copied().filter(|n| matches!(n, 'ゃ' | 'ゅ' | 'ょ'));
         if let Some(s) = small {
             let v = match s { 'ゃ' => "a", 'ゅ' => "u", _ => "o" };
@@ -94,6 +130,8 @@ pub fn split_morae(text: &str) -> Result<Vec<Mora>, KanaError> {
 /// Romaji of a mora for file names (Hepburn-like, ASCII only).
 pub fn romaji(m: &Mora) -> String {
     if m.kana == "ー" { return "-".to_string(); }
+    if m.consonant == "N" { return "N".to_string(); }
+    if m.consonant == "_" { return "_".to_string(); }
     let c = match m.consonant { "hy" => "h", "ng" => "ng", x => x };
     let pal = if m.palatalised { "y" } else { "" };
     if matches!(m.consonant, "sh" | "ch" | "j") && matches!(m.vowel, "a" | "u" | "o") && m.kana.chars().count() == 2 {
@@ -116,6 +154,7 @@ pub fn to_shift_jis(s: &str) -> Result<Vec<u8>, char> {
         let u = c as u32;
         match c {
             '\u{0}'..='\u{7f}' => out.push(u as u8),
+            'ゔ' => out.extend([0x83, 0x94]), // ヴ
             'ぁ'..='ん' => { let code = 0x829F + (u - 0x3041); out.extend([(code >> 8) as u8, (code & 0xff) as u8]); }
             'ァ'..='ヶ' => {
                 let mut code = 0x8340 + (u - 0x30A1);
@@ -189,5 +228,35 @@ mod tests {
         assert_eq!(to_shift_jis("ー").unwrap(), [0x81, 0x5B]);
         assert_eq!(to_shift_jis("a_1").unwrap(), b"a_1");
         assert_eq!(to_shift_jis("漢"), Err('漢'));
+    }
+
+    fn spell(text: &str) -> Vec<String> {
+        split_morae(text).unwrap().iter().map(|m| format!("{}{}{}", m.consonant, if m.palatalised { "y" } else { "" }, m.vowel)).collect()
+    }
+
+    #[test]
+    fn small_vowels_and_the_v_row() {
+        assert_eq!(spell("てぃとぅでぃどぅ"), ["ti", "tu", "di", "du"]);
+        assert_eq!(spell("つぁつぃつぇつぉ"), ["tsa", "tsi", "tse", "tso"]);
+        assert_eq!(spell("ふぁふぃふぇふぉ"), ["fa", "fi", "fe", "fo"]);
+        assert_eq!(spell("すぃずぃ"), ["si", "zi"]);
+        assert_eq!(spell("うぃうぇうぉいぇ"), ["wi", "we", "wo", "ye"]);
+        assert_eq!(spell("きぇぎぇにぇひぇみぇりぇびぇぴぇ"), ["kye", "gye", "nye", "hyye", "mye", "rye", "bye", "pye"]);
+        assert_eq!(spell("しぇちぇじぇ"), ["she", "che", "je"]); // already palatal
+        assert_eq!(spell("ヴぁヴぃヴヴぇヴぉ"), ["va", "vi", "vu", "ve", "vo"]);
+        assert_eq!(to_shift_jis("ヴぁ").unwrap(), [0x83, 0x94, 0x82, 0x9F]);
+        assert_eq!(split_morae("あぁ"), Err(KanaError::Dangling('ぁ')));
+        let m = split_morae("てぃ").unwrap();
+        assert_eq!((m.len(), m[0].kana.as_str()), (1, "てぃ"));
+    }
+
+    #[test]
+    fn rests_inside_a_line_only() {
+        assert_eq!(spell("_かか"), ["ka", "ka"]); // a leading rest just marks the start
+        assert_eq!(spell("あ_い"), ["a", "_a", "i"]); // the rest keeps the context vowel
+        assert_eq!(spell("あ__い"), ["a", "_a", "i"]);
+        assert_eq!(spell("あ_"), ["a"]);
+        assert_eq!(split_morae("_ん"), Err(KanaError::Dangling('ん')));
+        assert_eq!(romaji(&split_morae("あ_い").unwrap()[1]), "_");
     }
 }

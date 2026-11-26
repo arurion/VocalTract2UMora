@@ -134,11 +134,30 @@ pub fn detect_events(r: &Rendered, timing: &MoraTiming, manner: Manner, voiced: 
         Manner::Fricative => (audible, timing.consonant_end + 0.01),
         Manner::Glottal => (audible, voice),
         Manner::Glide => (audible, timing.consonant_end + 0.01),
-        Manner::None => (audible, audible + 0.02),
+        Manner::None | Manner::Rest => (audible, audible + 0.02),
     };
     let sound_s = sound_s.max(0.0);
     let vowel_onset_s = vowel_onset_s.max(sound_s + 0.010);
     OtoEvents { sound_s, release_s, voicing_onset_s, vowel_onset_s, vowel_rms }
+}
+
+/// Events of a moraic nasal ん that occupies `start_s..end_s` of the file. With a closure
+/// (n, m, ng) the "note start" is the moment the tract closes, i.e. where the previous vowel
+/// ends, as for a VC unit; the nasalised vowel N has no closure, so it is placed shortly after
+/// the start of its gesture, when the velum is open. `vowel_rms` is the level of the nasal.
+pub fn detect_moraic_nasal(r: &Rendered, start_s: f64, end_s: f64, closing: bool) -> OtoEvents {
+    let env = envelope(&r.audio, r.sample_rate);
+    let time_of = |k: usize| k as f64 * 0.001 + 0.0025;
+    let closure_s = if closing {
+        r.traces.iter().filter(|t| t.t_s >= start_s - 0.05 && t.t_s <= end_s).find(|t| t.min_area_cm2 < CLOSURE_AREA_CM2).map(|t| t.t_s)
+    } else {
+        None
+    };
+    let onset = closure_s.unwrap_or(start_s + 0.03);
+    let (v0, v1) = (onset + 0.04, end_s - 0.02);
+    let level: Vec<f64> = env.iter().enumerate().filter(|(k, _)| time_of(*k) >= v0 && time_of(*k) <= v1).map(|(_, e)| *e).collect();
+    let vowel_rms = if level.is_empty() { 1e-9 } else { level.iter().sum::<f64>() / level.len() as f64 };
+    OtoEvents { sound_s: (onset - 0.03).max(0.0), release_s: closure_s, voicing_onset_s: None, vowel_onset_s: onset, vowel_rms }
 }
 
 /// Steady part of the vowel that is kept after the note start (ms).
@@ -148,6 +167,12 @@ pub const LEFT_MARGIN_MS: f64 = 20.0;
 
 /// oto.ini times from the events. `total_s` is the length of the file.
 pub fn compute_oto(e: &OtoEvents, total_s: f64) -> OtoTimes {
+    compute_oto_steady(e, total_s, STEADY_VOWEL_MS)
+}
+
+/// Like `compute_oto`, with the length of the steady part that is kept after the note start
+/// (`steady_ms`): the right blank is placed so that the segment ends there.
+pub fn compute_oto_steady(e: &OtoEvents, total_s: f64, steady_ms: f64) -> OtoTimes {
     let total_ms = total_s * 1000.0;
     let offset = (e.sound_s * 1000.0 - LEFT_MARGIN_MS).max(0.0);
     let preutterance = (e.vowel_onset_s * 1000.0 - offset).max(1.0);
@@ -155,7 +180,7 @@ pub fn compute_oto(e: &OtoEvents, total_s: f64) -> OtoTimes {
     // The fixed (not stretched) region reaches a little into the vowel.
     let mut consonant = preutterance + 30.0;
     // The right blank keeps a steady vowel of STEADY_VOWEL_MS after the note start.
-    let keep_end = (offset + preutterance + STEADY_VOWEL_MS).min(total_ms - 60.0).max(offset + consonant + 50.0);
+    let keep_end = (offset + preutterance + steady_ms).min(total_ms - 60.0).max(offset + consonant + 50.0);
     let cutoff = -(total_ms - keep_end).max(0.0);
     consonant = consonant.min(keep_end - offset - 20.0);
     OtoTimes { offset, consonant, cutoff, preutterance, overlap }
