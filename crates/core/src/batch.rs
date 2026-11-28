@@ -11,13 +11,27 @@
 use crate::consonant::ConsonantEditor;
 use crate::kana::{romaji, split_morae, to_shift_jis, Mora};
 use crate::mora::{build_sequence, consonant_table, moraic_nasal_symbol, Manner, MoraItem, MoraOptions, MoraTiming};
-use crate::oto::{compute_oto, compute_oto_steady, detect_events, detect_moraic_nasal, OtoEntry};
+use crate::oto::{compute_oto, compute_oto_steady, compute_oto_vc, compute_oto_vcv, detect_events, detect_moraic_nasal, OtoEntry, OtoEvents, STEADY_VOWEL_MS};
 use crate::render::{render_score, wav_bytes, RenderOptions};
 use crate::speaker::Speaker;
 use crate::zip::ZipWriter;
 
+/// Kind of voicebank, i.e. the alias scheme of the oto.ini.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtoStyle {
+    /// CV single sounds: the alias is the bare kana (か, ん, ン). The first of equal aliases is kept.
+    Single,
+    /// Continuous (VCV): `a か` with the previous vowel (あ い う え お, or ん) and `- か` at the
+    /// head of a line or after a rest.
+    Vcv,
+    /// CVVC: the bare kana as CV (か) and VC units (`a k`, `a ng`, `i sh`, `a n` ...) from the
+    /// previous vowel into the consonant.
+    Cvvc,
+}
+
 #[derive(Debug, Clone)]
 pub struct BatchOptions {
+    pub style: OtoStyle,
     pub mora: MoraOptions,
     pub sample_rate: f64,
     /// Target RMS of the steady vowel (full scale = 1), so that all files have the same level.
@@ -27,7 +41,7 @@ pub struct BatchOptions {
 
 impl Default for BatchOptions {
     fn default() -> Self {
-        BatchOptions { mora: MoraOptions::default(), sample_rate: 44100.0, target_vowel_rms: 0.10, noise_seed: 1 }
+        BatchOptions { style: OtoStyle::Single, mora: MoraOptions::default(), sample_rate: 44100.0, target_vowel_rms: 0.10, noise_seed: 1 }
     }
 }
 
@@ -62,6 +76,37 @@ pub fn wav_file_name(index: usize, morae: &[Mora]) -> String {
     format!("{:03}_{}.wav", index + 1, r)
 }
 
+/// What precedes a mora in its line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Context {
+    /// Start of the line or after a rest.
+    Head,
+    /// A vowel: "a", "i", "u", "e" or "o".
+    Vowel(&'static str),
+    /// A moraic nasal.
+    Nasal,
+}
+
+impl Context {
+    /// Kana used in VCV aliases (`-`, あ い う え お, ん).
+    pub fn kana(self) -> &'static str {
+        match self { Context::Head => "-", Context::Nasal => "ん", Context::Vowel(v) => match v { "a" => "あ", "i" => "い", "u" => "う", "e" => "え", _ => "お" } }
+    }
+    /// Romaji used in VC aliases (`-`, a i u e o, n).
+    pub fn romaji(self) -> &'static str {
+        match self { Context::Head => "-", Context::Nasal => "n", Context::Vowel(v) => v }
+    }
+}
+
+/// The context of mora `k` and the index of the mora before it (if not at the head).
+pub fn context_of(morae: &[Mora], k: usize) -> (Context, Option<usize>) {
+    if k == 0 { return (Context::Head, None); }
+    let p = &morae[k - 1];
+    if p.kana == "_" { (Context::Head, None) }
+    else if p.consonant == "N" { (Context::Nasal, Some(k - 1)) }
+    else { (Context::Vowel(p.vowel), Some(k - 1)) }
+}
+
 /// Renders one recording (a run of morae spoken in one breath) and derives its oto entries.
 pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: &[Mora], opts: &BatchOptions) -> Result<LineResult, String> {
     let table = consonant_table();
@@ -86,21 +131,47 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     for (k, (m, slot)) in morae.iter().zip(&slots).enumerate() {
         let spec = &items[k].consonant;
         if spec.manner == Manner::Rest { continue; }
+        let (ctx, prev) = context_of(morae, k);
+        let head = ctx == Context::Head;
+        // A VC / VCV segment starts no earlier than the steady part of the previous sound.
+        let floor = prev.map(|j| if items[j].moraic { slots[j].start + 0.05 } else { slots[j].consonant_end + 0.03 }).unwrap_or(0.0);
         if items[k].moraic {
             // ん (n m ng) or ン (nasalised vowel N): a segment of its own, ending with the nasal
             // so that the next mora is not part of it. Not used for the level of the line.
             let closing = spec.symbol != "N";
             let ev = detect_moraic_nasal(&r, slot.start, slot.end, closing);
             let steady_ms = (slot.end - ev.vowel_onset_s) * 1000.0 - 10.0;
-            entries.push(compute_oto_steady(&ev, total, steady_ms).to_entry(&name, if closing { "ん" } else { "ン" }));
+            let nasal = if closing { "ん" } else { "ン" };
+            match opts.style {
+                OtoStyle::Single => entries.push(compute_oto_steady(&ev, total, steady_ms).to_entry(&name, nasal)),
+                OtoStyle::Vcv if head => entries.push(compute_oto_steady(&ev, total, steady_ms).to_entry(&name, &format!("- {nasal}"))),
+                OtoStyle::Vcv => entries.push(compute_oto_vcv(&ev, total, steady_ms, floor).to_entry(&name, &format!("{} {nasal}", ctx.kana()))),
+                OtoStyle::Cvvc if !head => {
+                    // "a n" / "a m" / "a ng" / "a N": the whole nasal is the VC unit.
+                    let vc = OtoEvents { release_s: Some(slot.end - 0.01), ..ev };
+                    entries.push(compute_oto_vc(&vc, total, floor).to_entry(&name, &format!("{} {}", ctx.romaji(), spec.symbol)));
+                }
+                OtoStyle::Cvvc => {}
+            }
             continue;
         }
         let timing = MoraTiming { pressure_on: (slot.start - 0.03).max(0.0), consonant_end: slot.consonant_end, total: slot.end };
         let ev = detect_events(&r, &timing, spec.manner, spec.voiced);
         vowel_rms_sum += ev.vowel_rms;
         n += 1.0;
-        if m.kana != "ー" {
-            entries.push(compute_oto(&ev, total).to_entry(&name, &m.kana));
+        if m.kana == "ー" { continue; }
+        let kana = m.kana.as_str();
+        match opts.style {
+            OtoStyle::Single => entries.push(compute_oto(&ev, total).to_entry(&name, kana)),
+            OtoStyle::Vcv if head => entries.push(compute_oto(&ev, total).to_entry(&name, &format!("- {kana}"))),
+            OtoStyle::Vcv => entries.push(compute_oto_vcv(&ev, total, STEADY_VOWEL_MS, floor).to_entry(&name, &format!("{} {kana}", ctx.kana()))),
+            OtoStyle::Cvvc => {
+                entries.push(compute_oto(&ev, total).to_entry(&name, kana));
+                if !head && spec.manner != Manner::None {
+                    let sym = if m.palatalised && !matches!(spec.symbol, "sh" | "ch" | "j") { format!("{}y", spec.symbol) } else { spec.symbol.to_string() };
+                    entries.push(compute_oto_vc(&ev, total, floor).to_entry(&name, &format!("{} {sym}", ctx.romaji())));
+                }
+            }
         }
     }
     let mean_rms = (vowel_rms_sum / n).max(1e-9);
@@ -108,6 +179,53 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     let gain = (opts.target_vowel_rms / mean_rms).min(0.95 / peak);
     let samples: Vec<f64> = r.audio.iter().map(|v| (v * gain).clamp(-1.0, 1.0)).collect();
     Ok(LineResult { wav_name: name, wav: wav_bytes(&samples, opts.sample_rate as u32), entries })
+}
+
+/// Keeps the first entry of every alias (UTAU uses the first match anyway).
+pub fn dedupe_entries(entries: Vec<OtoEntry>) -> Vec<OtoEntry> {
+    let mut seen = std::collections::HashSet::new();
+    entries.into_iter().filter(|e| seen.insert(e.alias.clone())).collect()
+}
+
+/// A finished voicebank.
+#[derive(Debug, Clone)]
+pub struct BuildReport {
+    pub zip: Vec<u8>,
+    /// Lines that could not be read or rendered ("N行目「...」: reason").
+    pub errors: Vec<String>,
+    /// Entries in oto.ini and WAV files in the archive.
+    pub entries: usize,
+    pub files: usize,
+}
+
+/// Bundles rendered lines into a voicebank: equal aliases are reduced to the first one, WAV files
+/// without any remaining entry are left out. (The rendering of the lines can happen anywhere,
+/// e.g. in parallel workers; `index` of `render_line` must be the position in `results`.)
+pub fn assemble_voicebank(results: Vec<LineResult>, errors: Vec<String>, character_name: &str) -> Result<BuildReport, String> {
+    let all: Vec<OtoEntry> = results.iter().flat_map(|r| r.entries.clone()).collect();
+    let entries = dedupe_entries(all);
+    let used: std::collections::HashSet<&str> = entries.iter().map(|e| e.wav.as_str()).collect();
+    let files: Vec<(String, Vec<u8>)> = results.iter().filter(|r| used.contains(r.wav_name.as_str())).map(|r| (r.wav_name.clone(), r.wav.clone())).collect();
+    let oto = oto_ini_bytes(&entries).map_err(|c| format!("alias に Shift_JIS で表せない文字「{c}」があります"))?;
+    let zip = voicebank_zip(&files, &oto, character_name);
+    Ok(BuildReport { zip, errors, entries: entries.len(), files: files.len() })
+}
+
+/// Renders every line of a recording list one after the other and bundles the voicebank.
+pub fn build_voicebank(sp: &Speaker, editor: &ConsonantEditor, list_text: &str, opts: &BatchOptions, character_name: &str) -> Result<BuildReport, String> {
+    let mut results = vec![];
+    let mut errors = vec![];
+    for line in parse_list(list_text) {
+        let fail = |e: String| format!("{}行目「{}」: {e}", line.line_no, line.text);
+        match &line.morae {
+            Err(e) => errors.push(fail(e.clone())),
+            Ok(m) => match render_line(sp, editor, results.len(), m, opts) {
+                Ok(r) => results.push(r),
+                Err(e) => errors.push(fail(e)),
+            },
+        }
+    }
+    assemble_voicebank(results, errors, character_name)
 }
 
 /// oto.ini text (Shift_JIS bytes). `Err(char)` if an alias has a character that Shift_JIS
@@ -272,6 +390,87 @@ mod tests {
         let (vowel, rest) = (rms(0.30, 0.45), rms(0.55, 0.75));
         println!("vowel rms {vowel:.0}, rest rms {rest:.0}");
         assert!(rest < 0.05 * vowel, "the rest is not silent: {rest} vs {vowel}");
+    }
+
+    fn aliases(style: OtoStyle, text: &str) -> (Vec<OtoEntry>, f64) {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let o = BatchOptions { style, ..BatchOptions::default() };
+        let r = render_line(&sp, &ed, 0, &split_morae(text).unwrap(), &o).unwrap();
+        let total_ms = (r.wav.len() as f64 - 44.0) / 2.0 / 44.1;
+        (r.entries, total_ms)
+    }
+
+    fn sane(e: &OtoEntry, total_ms: f64) {
+        assert!(e.offset >= 0.0 && e.preutterance >= 1.0 && e.overlap >= 0.0 && e.overlap < e.preutterance, "{e:?}");
+        assert!(e.cutoff < 0.0 && e.offset + e.consonant <= total_ms + e.cutoff + 1.0, "{e:?} of {total_ms} ms");
+        assert!(e.consonant >= e.preutterance - 1e-9, "{e:?}");
+    }
+
+    #[test]
+    fn vcv_aliases_use_the_previous_vowel() {
+        let (entries, total) = aliases(OtoStyle::Vcv, "_あかいかんまあ_さ");
+        let names: Vec<&str> = entries.iter().map(|e| e.alias.as_str()).collect();
+        assert_eq!(names, ["- あ", "あ か", "あ い", "い か", "あ ん", "ん ま", "あ あ", "- さ"]);
+        for e in &entries { sane(e, total); }
+        // A VCV unit starts inside the previous vowel: a long preutterance (vowel part + consonant).
+        let (ka, head) = (&entries[1], &entries[0]);
+        assert!(ka.preutterance > 90.0, "{ka:?}");
+        assert!(ka.preutterance > head.preutterance + 50.0, "{ka:?} {head:?}");
+        // The segment of "あ ん" ends with the nasal.
+        let nasal = &entries[4];
+        let len = total + nasal.cutoff - nasal.offset; // the kept part of the file
+        assert!(nasal.preutterance > 90.0 && (250.0..420.0).contains(&len), "{nasal:?}: {len} ms kept");
+    }
+
+    #[test]
+    fn cvvc_has_cv_and_vc_units() {
+        let (entries, total) = aliases(OtoStyle::Cvvc, "_あかさんな");
+        let names: Vec<&str> = entries.iter().map(|e| e.alias.as_str()).collect();
+        assert_eq!(names, ["あ", "か", "a k", "さ", "a s", "a n", "な", "n n"]);
+        for e in &entries { sane(e, total); }
+        // The VC unit ends before the following vowel: much shorter than the CV unit.
+        let vc = entries.iter().find(|e| e.alias == "a k").unwrap();
+        let cv = entries.iter().find(|e| e.alias == "か").unwrap();
+        assert!(vc.preutterance < 130.0 && vc.overlap <= vc.preutterance / 3.0 + 0.5, "{vc:?}");
+        assert!(total + vc.cutoff < cv.offset + cv.preutterance + 5.0, "VC reaches into the vowel: {vc:?} {cv:?}");
+    }
+
+    #[test]
+    fn built_in_list_covers_every_context() {
+        let list = crate::lists::kurosu8_list();
+        let lines = parse_list(&list);
+        assert_eq!(lines.len(), 29 * 5);
+        let mut seen = std::collections::HashSet::new();
+        for l in &lines {
+            let m = l.morae.as_ref().unwrap_or_else(|e| panic!("{}: {e}", l.text));
+            for k in 0..m.len() {
+                if m[k].consonant == "N" { continue; }
+                seen.insert((context_of(&m, k).0.kana(), m[k].kana.clone()));
+            }
+        }
+        for ctx in ["-", "あ", "い", "う", "え", "お", "ん"] {
+            for kana in ["あ", "か", "き", "し", "ちゃ", "つぁ", "ふぇ", "ゔぉ", "いぇ", "うぃ", "ぴょ", "てぃ"] {
+                assert!(seen.contains(&(ctx, kana.to_string())), "missing {ctx} {kana}");
+            }
+        }
+    }
+
+    #[test]
+    fn voicebank_is_assembled_without_duplicates() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let o = BatchOptions::default();
+        let rep = build_voicebank(&sp, &ed, "# test\nあか\nかあ\nxyz\n", &o, "テスト").unwrap();
+        // Single: あ, か from the first line; the second line only repeats them.
+        assert_eq!((rep.entries, rep.files), (2, 1));
+        assert_eq!(rep.errors.len(), 1);
+        assert!(rep.errors[0].starts_with("4行目「xyz」"), "{:?}", rep.errors);
+        assert!(rep.zip.len() > 1000 && &rep.zip[..2] == b"PK");
+        let vcv = BatchOptions { style: OtoStyle::Vcv, ..BatchOptions::default() };
+        let rep = build_voicebank(&sp, &ed, "_あか\n_かあ\n", &vcv, "テスト").unwrap();
+        // - あ, あ か, - か, か あ
+        assert_eq!((rep.entries, rep.files), (4, 2));
     }
 
     #[test]

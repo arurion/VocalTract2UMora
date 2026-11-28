@@ -57,6 +57,9 @@ pub struct OtoEvents {
     pub voicing_onset_s: Option<f64>,
     /// The vowel has begun: the point where the consonant ends and the note starts.
     pub vowel_onset_s: f64,
+    /// The previous sound ends and this mora's consonant begins (closure of the tract, or the
+    /// start of the articulatory movement): the VC boundary of a VCV / CVVC unit.
+    pub vowel_end_s: f64,
     /// Level of the steady vowel (RMS), the reference for the thresholds.
     pub vowel_rms: f64,
 }
@@ -104,12 +107,17 @@ pub fn detect_events(r: &Rendered, timing: &MoraTiming, manner: Manner, voiced: 
     // Closure: the first time the narrowest section is below the threshold, until it opens.
     let mut release_s = None;
     let mut closed_seen = false;
+    let mut closure_start_s = None;
     for t in &r.traces {
         if t.t_s < timing.pressure_on - 0.05 { continue; }
         if t.t_s > timing.total { break; } // stay inside this mora's window (it may be one of many)
-        if t.min_area_cm2 < CLOSURE_AREA_CM2 { closed_seen = true; }
-        else if closed_seen { release_s = Some(t.t_s); break; }
+        if t.min_area_cm2 < CLOSURE_AREA_CM2 {
+            if !closed_seen { closure_start_s = Some(t.t_s); }
+            closed_seen = true;
+        } else if closed_seen { release_s = Some(t.t_s); break; }
     }
+    // The articulators start to move when the mora begins (pressure_on is 30 ms earlier).
+    let vowel_end_s = closure_start_s.unwrap_or(timing.pressure_on + 0.03 + 0.015);
 
     // Voicing: strong vibration of the vocal folds after the consonant.
     let steady_amp = {
@@ -138,7 +146,7 @@ pub fn detect_events(r: &Rendered, timing: &MoraTiming, manner: Manner, voiced: 
     };
     let sound_s = sound_s.max(0.0);
     let vowel_onset_s = vowel_onset_s.max(sound_s + 0.010);
-    OtoEvents { sound_s, release_s, voicing_onset_s, vowel_onset_s, vowel_rms }
+    OtoEvents { sound_s, release_s, voicing_onset_s, vowel_onset_s, vowel_end_s, vowel_rms }
 }
 
 /// Events of a moraic nasal ん that occupies `start_s..end_s` of the file. With a closure
@@ -157,7 +165,7 @@ pub fn detect_moraic_nasal(r: &Rendered, start_s: f64, end_s: f64, closing: bool
     let (v0, v1) = (onset + 0.04, end_s - 0.02);
     let level: Vec<f64> = env.iter().enumerate().filter(|(k, _)| time_of(*k) >= v0 && time_of(*k) <= v1).map(|(_, e)| *e).collect();
     let vowel_rms = if level.is_empty() { 1e-9 } else { level.iter().sum::<f64>() / level.len() as f64 };
-    OtoEvents { sound_s: (onset - 0.03).max(0.0), release_s: closure_s, voicing_onset_s: None, vowel_onset_s: onset, vowel_rms }
+    OtoEvents { sound_s: (onset - 0.03).max(0.0), release_s: closure_s, voicing_onset_s: None, vowel_onset_s: onset, vowel_end_s: onset, vowel_rms }
 }
 
 /// Steady part of the vowel that is kept after the note start (ms).
@@ -173,8 +181,38 @@ pub fn compute_oto(e: &OtoEvents, total_s: f64) -> OtoTimes {
 /// Like `compute_oto`, with the length of the steady part that is kept after the note start
 /// (`steady_ms`): the right blank is placed so that the segment ends there.
 pub fn compute_oto_steady(e: &OtoEvents, total_s: f64, steady_ms: f64) -> OtoTimes {
+    compute_oto_from(e, total_s, steady_ms, (e.sound_s * 1000.0 - LEFT_MARGIN_MS).max(0.0))
+}
+
+/// Part of the previous vowel that a VCV / VC unit starts with (ms).
+pub const VC_LEAD_MS: f64 = 110.0;
+
+/// Oto of a VCV unit ("a か"): the segment starts inside the previous vowel (`VC_LEAD_MS`
+/// before the consonant begins, but not before `floor_s`, e.g. the steady part of that vowel)
+/// and the note starts, as for a CV, where the consonant ends.
+pub fn compute_oto_vcv(e: &OtoEvents, total_s: f64, steady_ms: f64, floor_s: f64) -> OtoTimes {
+    let offset = (e.vowel_end_s * 1000.0 - VC_LEAD_MS).max(floor_s * 1000.0).max(0.0);
+    compute_oto_from(e, total_s, steady_ms, offset)
+}
+
+/// Oto of a VC unit ("a k"): from inside the previous vowel to the end of the consonant that
+/// is part of it (the closure of a plosive, nasal, affricate or tap, up to the vowel for
+/// fricatives); the following vowel is not part of the segment. The note starts where the
+/// vowel ends, i.e. at the beginning of the consonant; the overlap is a third of that.
+pub fn compute_oto_vc(e: &OtoEvents, total_s: f64, floor_s: f64) -> OtoTimes {
     let total_ms = total_s * 1000.0;
-    let offset = (e.sound_s * 1000.0 - LEFT_MARGIN_MS).max(0.0);
+    let offset = (e.vowel_end_s * 1000.0 - VC_LEAD_MS).max(floor_s * 1000.0).max(0.0);
+    let preutterance = (e.vowel_end_s * 1000.0 - offset).max(1.0);
+    let overlap = (preutterance / 3.0).clamp(1.0, 40.0).min(preutterance - 0.5).max(0.0);
+    let vc_end_s = e.release_s.unwrap_or(e.vowel_onset_s - 0.01).max(e.vowel_end_s + 0.02);
+    let keep_end = (vc_end_s * 1000.0).min(total_ms - 10.0);
+    let cutoff = -(total_ms - keep_end).max(0.0);
+    let consonant = (preutterance + 40.0).min(keep_end - offset - 5.0).max(preutterance);
+    OtoTimes { offset, consonant, cutoff, preutterance, overlap }
+}
+
+fn compute_oto_from(e: &OtoEvents, total_s: f64, steady_ms: f64, offset: f64) -> OtoTimes {
+    let total_ms = total_s * 1000.0;
     let preutterance = (e.vowel_onset_s * 1000.0 - offset).max(1.0);
     let overlap = (preutterance / 3.0).clamp(5.0, 40.0).min(preutterance - 1.0).max(0.0);
     // The fixed (not stretched) region reaches a little into the vowel.
