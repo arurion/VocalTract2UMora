@@ -46,6 +46,15 @@ jobs:
         env:
           VITE_BASE: /${{ github.event.repository.name }}/
 
+      - name: Browser smoke test (the built app must start and generate a voicebank)
+        run: |
+          npm install --no-save --no-audit --no-fund playwright@1.48.0
+          npx playwright install --with-deps chromium
+          node tests/smoke.mjs
+        working-directory: web
+        env:
+          VITE_BASE: /${{ github.event.repository.name }}/
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web/dist
