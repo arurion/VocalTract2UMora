@@ -13,12 +13,21 @@ const port = 4173;
 const origin = `http://localhost:${port}`;
 const fail = (msg) => { console.error(`SMOKE FAIL: ${msg}`); process.exitCode = 1; };
 
-const server = spawn("npx", ["vite", "preview", "--port", String(port), "--strictPort"], { stdio: ["ignore", "pipe", "inherit"], env: process.env });
-await new Promise((resolve, reject) => {
-  const t = setTimeout(() => reject(new Error("vite preview did not start")), 30000);
-  server.stdout.on("data", (d) => { if (String(d).includes("localhost")) { clearTimeout(t); resolve(); } });
-  server.on("exit", (c) => reject(new Error(`vite preview exited (${c})`)));
-});
+// Own process group, so that the whole `npx -> vite` tree can be stopped at the end (a leftover
+// child would keep the pipe open and the script would never exit).
+const server = spawn("npx", ["vite", "preview", "--port", String(port), "--strictPort"], { stdio: ["ignore", "pipe", "inherit"], env: process.env, detached: true });
+const stopServer = () => { try { process.kill(-server.pid, "SIGKILL"); } catch { /* already gone */ } };
+try {
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("vite preview did not start")), 30000);
+    server.stdout.on("data", (d) => { if (String(d).includes("localhost")) { clearTimeout(t); resolve(); } });
+    server.on("exit", (c) => reject(new Error(`vite preview exited (${c})`)));
+  });
+} catch (e) {
+  stopServer();
+  console.error(`SMOKE FAIL: ${e}`);
+  process.exit(1);
+}
 
 const browser = await chromium.launch();
 try {
@@ -62,5 +71,6 @@ try {
   fail(String(e));
 } finally {
   await browser.close();
-  server.kill();
+  stopServer();
 }
+process.exit(process.exitCode ?? 0);

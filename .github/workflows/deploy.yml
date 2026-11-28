@@ -47,6 +47,7 @@ jobs:
           VITE_BASE: /${{ github.event.repository.name }}/
 
       - name: Browser smoke test (the built app must start and generate a voicebank)
+        timeout-minutes: 10
         run: |
           npm install --no-save --no-audit --no-fund playwright@1.48.0
           npx playwright install --with-deps chromium
