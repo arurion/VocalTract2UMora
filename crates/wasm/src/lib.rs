@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+use vt2umora_core::batch::{self, Assembled, BatchOptions, LineResult, OtoStyle};
+use vt2umora_core::consonant::ConsonantEditor;
 use vt2umora_core::geometry::SpeakerGeometry;
 use vt2umora_core::lf::{self, LfError, LfShape, VoiceParams};
+use vt2umora_core::oto::OtoEntry;
+use vt2umora_core::speaker::Speaker;
 use wasm_bindgen::prelude::*;
 
 /// Crate version, used by the UI to confirm the Wasm module loaded.
@@ -95,4 +99,179 @@ pub fn geometry_info(tract_length_cm: f64, oral_ratio: f64, nasal_volume_scale: 
         f[1],
         f[2],
     ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Batch voicebank generation. Every Web Worker owns an `Engine` and renders whole lines;
+// the main thread collects the results in an `Assembler` and gets the ZIP from it.
+// ---------------------------------------------------------------------------------------------
+
+const BUNDLED_SPEAKER: &str = include_str!("../../../resources/JD3.speaker");
+
+fn parse_style(style: &str) -> Result<OtoStyle, JsError> {
+    match style {
+        "single" => Ok(OtoStyle::Single),
+        "vcv" => Ok(OtoStyle::Vcv),
+        "cvvc" => Ok(OtoStyle::Cvvc),
+        s => Err(JsError::new(&format!("unknown style {s} (single, vcv or cvvc)"))),
+    }
+}
+
+/// The built-in recording list (Kurosu 8-mora structure, 145 lines).
+#[wasm_bindgen]
+pub fn builtin_list() -> String {
+    vt2umora_core::lists::kurosu8_list()
+}
+
+/// A recording list read line by line: which lines are usable and why the others are not.
+#[wasm_bindgen]
+pub struct ListPlan {
+    lines: Vec<batch::ListLine>,
+}
+
+/// Reads a recording list (comments and empty lines dropped).
+#[wasm_bindgen]
+pub fn plan_list(text: &str) -> ListPlan {
+    ListPlan { lines: batch::parse_list(text) }
+}
+
+#[wasm_bindgen]
+impl ListPlan {
+    #[wasm_bindgen(getter)]
+    pub fn len(&self) -> usize { self.lines.len() }
+    /// 1-based line number in the list text.
+    pub fn line_no(&self, i: usize) -> usize { self.lines[i].line_no }
+    pub fn text(&self, i: usize) -> String { self.lines[i].text.clone() }
+    /// Number of morae of the line, 0 if it cannot be read.
+    pub fn mora_count(&self, i: usize) -> usize { self.lines[i].morae.as_ref().map(|m| m.len()).unwrap_or(0) }
+    /// Why the line cannot be read ("" if it can).
+    pub fn error(&self, i: usize) -> String { self.lines[i].morae.as_ref().err().cloned().unwrap_or_default() }
+}
+
+/// Settings of a batch run.
+#[wasm_bindgen]
+pub struct BatchConfig {
+    style: OtoStyle,
+    inner: BatchOptions,
+}
+
+#[wasm_bindgen]
+impl BatchConfig {
+    /// `style`: "single", "vcv" or "cvvc".
+    #[wasm_bindgen(constructor)]
+    pub fn new(style: &str) -> Result<BatchConfig, JsError> {
+        let style = parse_style(style)?;
+        Ok(BatchConfig { style, inner: BatchOptions { style, ..BatchOptions::default() } })
+    }
+    pub fn set_f0_hz(&mut self, v: f64) { self.inner.mora.f0_hz = v.clamp(40.0, 600.0); }
+    pub fn set_pressure_dpa(&mut self, v: f64) { self.inner.mora.pressure_dpa = v.clamp(500.0, 20000.0); }
+    pub fn set_vowel_hold_s(&mut self, v: f64) { self.inner.mora.vowel_hold_s = v.clamp(0.15, 1.5); }
+    pub fn set_moraic_nasal_s(&mut self, v: f64) { self.inner.mora.moraic_nasal_s = v.clamp(0.08, 0.6); }
+    pub fn set_rest_s(&mut self, v: f64) { self.inner.mora.rest_s = v.clamp(0.1, 1.5); }
+    pub fn set_sample_rate(&mut self, v: f64) { self.inner.sample_rate = v.clamp(16000.0, 96000.0); }
+    pub fn set_target_vowel_rms(&mut self, v: f64) { self.inner.target_vowel_rms = v.clamp(0.01, 0.4); }
+    /// Geometry step of the renderer: 1 is exact, 2 (default) and 4 are faster.
+    pub fn set_geometry_stride(&mut self, v: u32) { self.inner.geometry_stride = (v as usize).clamp(1, 8); }
+    pub fn set_noise_seed(&mut self, v: u32) { self.inner.noise_seed = v as u64; }
+    #[wasm_bindgen(getter)]
+    pub fn style(&self) -> String {
+        match self.style { OtoStyle::Single => "single", OtoStyle::Vcv => "vcv", OtoStyle::Cvvc => "cvvc" }.to_string()
+    }
+}
+
+/// The synthesiser of one worker: a speaker and its consonant targets.
+#[wasm_bindgen]
+pub struct Engine {
+    speaker: Speaker,
+    editor: ConsonantEditor,
+}
+
+#[wasm_bindgen]
+impl Engine {
+    /// With `speaker_xml` empty the bundled speaker (JD3) is used.
+    #[wasm_bindgen(constructor)]
+    pub fn new(speaker_xml: &str) -> Result<Engine, JsError> {
+        let xml = if speaker_xml.trim().is_empty() { BUNDLED_SPEAKER } else { speaker_xml };
+        let speaker = Speaker::from_xml(xml).map_err(|e| JsError::new(&format!("speaker file: {e}")))?;
+        let editor = ConsonantEditor::from_speaker(&speaker).ok_or_else(|| JsError::new("speaker file has no consonant shapes"))?;
+        Ok(Engine { speaker, editor })
+    }
+
+    /// Renders one line of a list (text of the line, `index` = position among the readable
+    /// lines, which also numbers the WAV file).
+    pub fn render_line(&self, line_text: &str, index: usize, config: &BatchConfig) -> Result<RenderedLine, JsError> {
+        let morae = vt2umora_core::kana::split_morae(line_text).map_err(|e| JsError::new(&e.to_string()))?;
+        let r = batch::render_line(&self.speaker, &self.editor, index, &morae, &config.inner).map_err(|e| JsError::new(&e))?;
+        Ok(RenderedLine { inner: r })
+    }
+}
+
+/// One rendered line: the WAV file and its oto entries.
+#[wasm_bindgen]
+pub struct RenderedLine {
+    inner: LineResult,
+}
+
+#[wasm_bindgen]
+impl RenderedLine {
+    #[wasm_bindgen(getter)]
+    pub fn wav_name(&self) -> String { self.inner.wav_name.clone() }
+    pub fn wav(&self) -> Vec<u8> { self.inner.wav.clone() }
+    #[wasm_bindgen(getter)]
+    pub fn entry_count(&self) -> usize { self.inner.entries.len() }
+    pub fn entry_alias(&self, k: usize) -> String { self.inner.entries[k].alias.clone() }
+    /// `[offset, consonant, cutoff, preutterance, overlap]` in ms.
+    pub fn entry_times(&self, k: usize) -> Vec<f64> {
+        let e: &OtoEntry = &self.inner.entries[k];
+        vec![e.offset, e.consonant, e.cutoff, e.preutterance, e.overlap]
+    }
+}
+
+/// Collects the rendered lines (in list order) and builds the voicebank.
+#[wasm_bindgen]
+pub struct Assembler {
+    results: Vec<LineResult>,
+    errors: Vec<String>,
+    built: Option<Assembled>,
+}
+
+#[wasm_bindgen]
+pub fn new_assembler() -> Assembler {
+    Assembler { results: vec![], errors: vec![], built: None }
+}
+
+#[wasm_bindgen]
+impl Assembler {
+    /// Adds a line rendered by a worker. Lines must be added in list order.
+    pub fn add_line(&mut self, line: &RenderedLine) {
+        self.results.push(line.inner.clone());
+    }
+    /// Adds a line from its parts (when the result came over `postMessage`): returns its index.
+    pub fn add_wav(&mut self, wav_name: &str, wav: Vec<u8>) -> usize {
+        self.results.push(LineResult { wav_name: wav_name.to_string(), wav, entries: vec![] });
+        self.results.len() - 1
+    }
+    /// `times` = `[offset, consonant, cutoff, preutterance, overlap]`.
+    pub fn add_entry(&mut self, line: usize, alias: &str, times: &[f64]) {
+        if times.len() != 5 { return; }
+        let wav = self.results[line].wav_name.clone();
+        self.results[line].entries.push(OtoEntry { wav, alias: alias.to_string(), offset: times[0], consonant: times[1], cutoff: times[2], preutterance: times[3], overlap: times[4] });
+    }
+    /// A line that could not be rendered ("N行目「...」: reason").
+    pub fn add_error(&mut self, message: &str) { self.errors.push(message.to_string()); }
+    /// Builds the voicebank; afterwards `zip`, `entries`, `files` and `oto_text` can be read.
+    pub fn finish(&mut self, character_name: &str) -> Result<(), JsError> {
+        let r = batch::assemble_voicebank_with_text(std::mem::take(&mut self.results), std::mem::take(&mut self.errors), character_name).map_err(|e| JsError::new(&e))?;
+        self.built = Some(r);
+        Ok(())
+    }
+    pub fn zip(&self) -> Vec<u8> { self.built.as_ref().map(|b| b.report.zip.clone()).unwrap_or_default() }
+    #[wasm_bindgen(getter)]
+    pub fn entries(&self) -> usize { self.built.as_ref().map(|b| b.report.entries).unwrap_or(0) }
+    #[wasm_bindgen(getter)]
+    pub fn files(&self) -> usize { self.built.as_ref().map(|b| b.report.files).unwrap_or(0) }
+    /// The oto.ini as text (UTF-8, for the preview; the ZIP has it in Shift_JIS).
+    pub fn oto_text(&self) -> String { self.built.as_ref().map(|b| b.oto_text.clone()).unwrap_or_default() }
+    /// Lines that could not be rendered, one per entry.
+    pub fn errors(&self) -> Vec<String> { self.built.as_ref().map(|b| b.report.errors.clone()).unwrap_or_default() }
 }

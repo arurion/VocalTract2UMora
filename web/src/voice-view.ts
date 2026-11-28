@@ -34,7 +34,8 @@ const defaults = (): State => {
   return { rd: 1.0, ra, rk, rg, breath: 8, asp: 0, f0: 120 };
 };
 
-let state: State = defaults();
+// Set in createVoiceView: defaults() calls into Wasm, which is only usable after init().
+let state!: State;
 const sliders = new Map<Key, Slider>();
 const hints: (() => void)[] = [];
 
@@ -54,6 +55,7 @@ function applyRd() {
 export function createVoiceView(onChange: () => void): View {
   const el = document.getElementById("view-voice")!;
   const $ = (id: string) => document.getElementById(id)!;
+  state = defaults();
 
   const host = $("controls");
   for (const g of GROUPS) {
