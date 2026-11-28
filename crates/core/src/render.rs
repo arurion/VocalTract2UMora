@@ -23,11 +23,14 @@ pub struct RenderOptions {
     pub trace_every: usize,
     /// Record the sagittal contours (one frame per 400 Hz curve step).
     pub record_geometry: bool,
+    /// The vocal tract shape is computed every `geometry_stride`-th step of the 400 Hz curves
+    /// and the tube is interpolated linearly in between (1: every step, as in the original).
+    pub geometry_stride: usize,
 }
 
 impl Default for RenderOptions {
     fn default() -> Self {
-        RenderOptions { sample_rate: 44100.0, noise_seed: 1, trace_every: 44, record_geometry: false }
+        RenderOptions { sample_rate: 44100.0, noise_seed: 1, trace_every: 44, record_geometry: false, geometry_stride: 1 }
     }
 }
 
@@ -105,6 +108,9 @@ fn outline_points(s: &crate::splines::LineStrip2D) -> Vec<P2> {
 }
 
 /// Renders the score. The audio is at `opts.sample_rate`, scaled by the synthesizer (about +-0.3).
+/// Largest change of any tract parameter for which the previous vocal tract shape is reused.
+const REUSE_TOLERANCE: f64 = 1e-6;
+
 pub fn render_score(sp: &Speaker, editor: &ConsonantEditor, score: &GestureScore, opts: &RenderOptions) -> Rendered {
     let fs = opts.sample_rate;
     let curves: Curves = score.calc_curves(sp, editor);
@@ -116,9 +122,17 @@ pub fn render_score(sp: &Speaker, editor: &ConsonantEditor, score: &GestureScore
     synth.set_noise_seed(opts.noise_seed);
 
     let mut frames: Vec<GeometryFrame> = vec![];
-    let tube_at = |vt: &mut VocalTract, frames: &mut Vec<GeometryFrame>, idx: usize, record: bool| -> Tube {
+    // The geometry is the expensive part. While the parameters hardly change (a held vowel, a
+    // rest) the previous tube is reused; the threshold is far below anything audible.
+    let mut last: Option<([f64; crate::speaker::NUM_PARAMS], Tube)> = None;
+    let mut tube_at = |vt: &mut VocalTract, frames: &mut Vec<GeometryFrame>, idx: usize, record: bool| -> Tube {
         let mut params = [0.0; crate::speaker::NUM_PARAMS];
         for p in 0..params.len() { params[p] = curves.tract[p][idx]; }
+        if !record {
+            if let Some((lp, lt)) = &last {
+                if params.iter().zip(lp.iter()).all(|(a, b)| (a - b).abs() < REUSE_TOLERANCE) { return lt.clone(); }
+            }
+        }
         vt.set_params(&params);
         vt.calculate_all();
         if record {
@@ -132,28 +146,33 @@ pub fn render_score(sp: &Speaker, editor: &ConsonantEditor, score: &GestureScore
                 tongue_palate_gap_cm: gap,
             });
         }
-        vt.get_tube()
+        let tube = vt.get_tube();
+        last = Some((params, tube.clone()));
+        tube
     };
 
     let mut audio = Vec::with_capacity(total);
     let mut traces = Vec::with_capacity(total / opts.trace_every.max(1) + 1);
     let (mut left_idx, mut left_tube, mut right_tube): (i64, Tube, Tube) = (-1, Tube::default(), Tube::default());
     let mut tube = Tube::default();
+    let stride = opts.geometry_stride.max(1) as i64;
     for n in 0..total {
         let pos = n as f64 / fs;
-        let mut needed = (pos * crate::gesture::CURVE_SAMPLING_RATE as f64) as i64;
-        if needed > n_curve as i64 - 2 { needed = n_curve as i64 - 2; }
+        let curve_pos = pos * crate::gesture::CURVE_SAMPLING_RATE as f64;
+        let mut needed = (curve_pos / stride as f64).floor() as i64 * stride;
+        let max_left = (n_curve as i64 - 1 - stride).max(0);
+        if needed > max_left { needed = max_left; }
         if needed != left_idx {
-            if left_idx != -1 && needed == left_idx + 1 {
+            if left_idx != -1 && needed == left_idx + stride {
                 std::mem::swap(&mut left_tube, &mut right_tube);
-                right_tube = tube_at(&mut vt, &mut frames, (needed + 1) as usize, opts.record_geometry);
+                right_tube = tube_at(&mut vt, &mut frames, (needed + stride) as usize, opts.record_geometry);
             } else {
                 left_tube = tube_at(&mut vt, &mut frames, needed as usize, opts.record_geometry);
-                right_tube = tube_at(&mut vt, &mut frames, (needed + 1) as usize, opts.record_geometry);
+                right_tube = tube_at(&mut vt, &mut frames, (needed + stride) as usize, opts.record_geometry);
             }
             left_idx = needed;
         }
-        let ratio = (pos - needed as f64 / crate::gesture::CURVE_SAMPLING_RATE as f64) * crate::gesture::CURVE_SAMPLING_RATE as f64;
+        let ratio = (curve_pos - needed as f64) / stride as f64;
         tube.interpolate_supraglottal(&left_tube, &right_tube, ratio);
 
         let (_tract, gl) = curves.params_at(pos);

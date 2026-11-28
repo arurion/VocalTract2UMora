@@ -73,7 +73,15 @@
 - **対応済み**(`kana.rs` / `mora.rs`): 休符 `_`(行頭は無視、行中は `MoraOptions::rest_s`=0.30 s の無音で肺気圧オフ、oto エントリなし)、小書き母音(てぃ とぅ でぃ どぅ つぁ〜つぉ ふぁ〜ふぉ すぃ ずぃ うぃ うぇ うぉ いぇ きぇ しぇ ちぇ ひぇ …)、ヴ行(v、Shift_JIS の ヴ で出力)。くろ州式 8 モーラ構造の行が休符・ん・特殊かな入りで通る(`kurosu_style_lines_with_rests_and_special_kana_render`)。
 - **未対応**: 語尾の子音単体(`k` など ASCII)、大文字の特殊子音記号、くろ州式の `_` の語頭/語中の区別を oto の alias に反映すること。
 - **最大の未解決(設計)**: 現在の oto は alias が裸のかな(「か」)の **CV 単独音**用。連続音リストを読んで連続音(VCV)音源を作るなら、alias を `a か`(前の母音+かな)・`- か`(語頭)・`a R`(語尾)・`a ん` にし、前の母音の定常部から切る必要がある(先行発声は子音の始まり、オーバーラップは先行発声の 1/3 が慣例)。物理モデルなら直前の母音を指定して直接合成できるので、リストの文脈どおりに録る必要すらない。ここをどうするか(リストの形式で自動判別するか、出力形式をユーザーが選ぶか)を決める。
-- **速度**: 8 モーラ(約 4 秒)の行のレンダリングは約 5 秒(実時間の 1.2〜1.7 倍、`cargo test` の最適化ビルド)。8 モーラ版の全 151 行(音声約 10 分)で約 15 分、Wasm ではさらに遅い見込み。行は独立なので、**Web Worker での並列化(SharedArrayBuffer/coi-serviceworker 前提)**と TDS の最適化(密行列 N×N の扱い、ノイズ源、サンプリング周波数)が必須。
+- **速度(対策済み・計測済み)**: `cargo run --release -p vt2umora-core --example bench` で内訳が出る。計測結果(リリースビルド): 声道形状 `calculate_all` が 1.7 ms/ステップ × 400 ステップ/秒 = 音声 1 秒あたり 0.67 秒(うち `calc_cross_sections` が 75%。`surface.rs` の交差判定はすでに矩形カット・リブ対カリング済みで、これ以上は設計変更が要る)、音響 `set_tube + step` が 0.25 秒。対策: (1) パラメータの変化が 1e-6 未満なら前の管を再利用(`render.rs` `REUSE_TOLERANCE`)、(2) `RenderOptions::geometry_stride`(形状を 400 Hz の曲線の何ステップごとに計算するか、間は管を線形補間。既定 1 = 原版どおり、`BatchOptions` の既定は 2。ストライド 2 で oto は最大 2 ms、4 で 6 ms しかずれない=テスト `a_coarser_geometry_step_keeps_the_oto_and_the_level`)。結果: 8 モーラ行 10 本のビルドが 32 秒 → 16 秒。内蔵リスト全 145 行で単一スレッド約 4 分(ネイティブ)。**次の手は Wasm 側の Web Worker 並列(行ごとに独立)**と、必要なら音響側(`prepare` の毎サンプル係数計算)の最適化。
+
+### a3. 出力形式(単独音・連続音・CVVC)と内蔵リスト (**実装済み**)
+- `batch::OtoStyle`: `Single`(CV 単独音。alias は裸のかな)、`Vcv`(連続音。`a か` / `ん か` / 語頭・休符後は `- か`)、`Cvvc`(裸の CV + VC `a k` `a ng` `i sh` `a n` …)。前の文脈は `batch::context_of`。
+- oto の計算(`oto.rs`): `OtoEvents.vowel_end_s`(前の音が終わり子音が始まる点 = 閉鎖の開始、閉鎖しない子音は調音運動の開始)。`compute_oto_vcv`(前の母音の中 110 ms から始め、先行発声は CV と同じく子音の終わり、オーバーラップは先行発声の 1/3 で上限 40 ms)、`compute_oto_vc`(前の母音から子音の閉鎖の終わりまで。破裂のバーストと後続母音は含めない)。ん/ン は VCV で `あ ん`/`あ ン`、CVVC で `a n`/`a m`/`a ng`/`a N`。
+- 同じ alias は最初の 1 件を残す(`dedupe_entries`)。使われない WAV は ZIP から外す(`assemble_voicebank`)。レンダリング自体は別の場所(Worker 並列など)でやってよい: `render_line(index, ..)` の index は results 内の位置。
+- `lists::kurosu8_list()`: くろ州式 8 モーラ構造(29 区画 × 5 行 = 145 行)を記事のルールで生成する内蔵リスト。母音パターン `[0,0,N,1,0,2,0,1]` を 5 通りずらすと、(前の母音 × 次の母音) の 25 通り、語頭、ん が全部出る(テスト `built_in_list_covers_every_context`)。物理モデルは録音不要なので、これが「全音素」の代わりになる。
+- CLI: `cargo run --release -p vt2umora-core --example build_bank -- <single|vcv|cvvc> <list.txt|builtin> <out.zip> [最大行数]`。
+- **未実装**: 語尾の `a R`、CVVC の `- か` 系、リストの形式からの自動判別(今は呼び出し側が `OtoStyle` を選ぶ)。
 
 ### b. Wasm API と UI
 `crates/wasm` に公開する: 話者読み込み(`JD3.speaker` を `include_str!` で同梱するか、ユーザーのファイル)、`ConsonantEditor`(基準形状の取得・上書きの設定/削除)、モーラ/スコアのレンダリング(音+トレース+フレーム)、`batch::render_line`、`oto_ini_bytes`、`voicebank_zip`。型付き配列で返すこと。

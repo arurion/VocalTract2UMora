@@ -17,6 +17,7 @@ pub mod glottis;
 pub mod iir;
 pub mod kana;
 pub mod lf;
+pub mod lists;
 pub mod mora;
 pub mod oto;
 pub mod render;
