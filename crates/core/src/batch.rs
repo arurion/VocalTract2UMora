@@ -200,6 +200,21 @@ pub struct BuildReport {
     pub files: usize,
 }
 
+/// A finished voicebank with the oto.ini as readable text (UTF-8) for previews.
+#[derive(Debug, Clone)]
+pub struct Assembled {
+    pub report: BuildReport,
+    pub oto_text: String,
+}
+
+/// Like `assemble_voicebank`, and also returns the oto.ini text.
+pub fn assemble_voicebank_with_text(results: Vec<LineResult>, errors: Vec<String>, character_name: &str) -> Result<Assembled, String> {
+    let all: Vec<OtoEntry> = results.iter().flat_map(|r| r.entries.clone()).collect();
+    let text: String = dedupe_entries(all).iter().map(|e| e.to_line() + "\n").collect();
+    let report = assemble_voicebank(results, errors, character_name)?;
+    Ok(Assembled { report, oto_text: text })
+}
+
 /// Bundles rendered lines into a voicebank: equal aliases are reduced to the first one, WAV files
 /// without any remaining entry are left out. (The rendering of the lines can happen anywhere,
 /// e.g. in parallel workers; `index` of `render_line` must be the position in `results`.)

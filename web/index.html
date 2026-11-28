@@ -66,6 +66,40 @@
           </div>
           <div class="controls" id="g-controls"></div>
         </section>
+
+        <section class="editor" id="view-export" hidden>
+          <div class="plots">
+            <div class="progress" id="e-progress">
+              <div class="plot-head">
+                <h2 id="e-p-title">待機中</h2>
+                <div class="readout"><span id="e-p-count"></span></div>
+              </div>
+              <div class="bar" id="e-bar" role="progressbar" aria-label="生成の進み具合" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="e-bar-fill"></i></div>
+              <p class="progress-line" id="e-p-line"></p>
+            </div>
+            <div class="plot">
+              <div class="plot-head">
+                <h2>録音リスト</h2>
+                <div class="readout"><span id="e-list-info"></span></div>
+              </div>
+              <textarea class="field list" id="e-list" rows="12" spellcheck="false" aria-label="録音リスト(1 行 = 1 回の発声。_ は休符、# で始まる行は注釈)"></textarea>
+              <div class="btn-row">
+                <button class="btn" id="e-builtin" type="button">内蔵リストに戻す</button>
+                <button class="btn" id="e-load" type="button">ファイルから読み込む</button>
+              </div>
+              <div class="issues" id="e-issues" role="status"></div>
+            </div>
+            <div class="plot" id="e-oto" hidden>
+              <div class="plot-head">
+                <h2>oto.ini</h2>
+                <div class="readout"><span id="e-oto-info"></span></div>
+              </div>
+              <div class="oto-head"><span>エイリアス</span><span>先行発声</span><span>オーバーラップ</span><span>子音部</span><span class="wavname">ファイル</span></div>
+              <div class="oto-body" id="e-oto-body"></div>
+            </div>
+          </div>
+          <div class="controls" id="e-controls"></div>
+        </section>
       </main>
     </div>
     <script type="module" src="./src/main.ts"></script>

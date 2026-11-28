@@ -84,11 +84,18 @@
 - **未実装**: 語尾の `a R`、CVVC の `- か` 系、リストの形式からの自動判別(今は呼び出し側が `OtoStyle` を選ぶ)。
 
 ### b. Wasm API と UI
-`crates/wasm` に公開する: 話者読み込み(`JD3.speaker` を `include_str!` で同梱するか、ユーザーのファイル)、`ConsonantEditor`(基準形状の取得・上書きの設定/削除)、モーラ/スコアのレンダリング(音+トレース+フレーム)、`batch::render_line`、`oto_ini_bytes`、`voicebank_zip`。型付き配列で返すこと。
+**書き出し(⑤)は実装・実機検証済み。子音エディタ(③)とスクラブ(④)が残り。**
+
+- **Wasm API**(`crates/wasm/src/lib.rs`): `Engine`(話者。空文字で同梱の JD3 を使う。`render_line(行, index, BatchConfig) -> RenderedLine`)、`BatchConfig`(形式 `single|vcv|cvvc`、f0、圧力、母音の長さ、ん・休符の長さ、サンプリング周波数、形状ストライド、ノイズ種)、`plan_list(text) -> ListPlan`(各行の読み取り結果とエラー)、`builtin_list()`、`new_assembler() -> Assembler`(`add_wav` / `add_entry` / `add_error` / `finish` / `zip` / `oto_text` / `errors`)。ワーカーが `RenderedLine` から wav と oto 値を取り出して `postMessage` で返し、メインスレッドの `Assembler` が重複排除と ZIP 化をする。SharedArrayBuffer は不要(各ワーカーが独立した Wasm インスタンス)で、Android の WebView 系ブラウザでも動く設計。
+- **Web**: `web/src/batch-worker.ts`(ワーカー)、`batch-runner.ts`(ワーカープール。動的割り当て、中止、進捗)、`batch-types.ts`、`export-view.ts`(画面)。画面: 形式(単独音/連続音/CVVC)、声(f0・母音の長さ)、速さ(標準/高精度/高速=形状ストライド 2/1/4、同時に生成する行数)、音源名、リスト(内蔵リスト/ファイル読み込み/直接編集、読めない行の指摘)、進捗(何行目・残り時間)、oto.ini プレビュー、ZIP ダウンロード。
+- **実機検証**(headless Firefox 161、Selenium): 内蔵リスト全 145 行を連続音形式で生成 → 7 分 38 秒(この環境は 2 コア・2 ワーカー)、oto 948 件、WAV 145 本、ZIP 46 MB、oto.ini は Shift_JIS。ワーカー 1 本あたりの速さはネイティブの約 3 倍遅い(Firefox の Wasm、この環境の CPU)。コア数が多い端末では並列数を上げれば比例して速くなる。
+- **見つけて直した既存バグ**: `voice-view.ts` が `defaults()`(Wasm 呼び出し)をモジュール先頭で実行しており、`init()` 前に例外が出てアプリ全体が起動しなかった(CI はビルドしか見ていなかった)。`createVoiceView` の中で初期化するよう修正。**実ブラウザでの起動確認を CI に入れる価値がある**(Playwright が使える環境なら、`vite preview` を立てて `#export` を開く程度のスモークテスト)。
+- **ブラウザ検証の手順**(サンドボックス向け): apt には Rust の wasm32 が無く、static.rust-lang.org も遮断される。conda-forge(conda.anaconda.org は許可)から micromamba を取り、`micromamba create -p /opt/rs -c conda-forge rust rust-std-wasm32-unknown-unknown wasm-pack binaryen` と `... -p /opt/ff firefox geckodriver`、`pip install selenium`。`npm run build` の後に `web/dist` を COOP/COEP ヘッダー付きの静的サーバーで配信し、Selenium で操作する。
+- **未実装(次)**: 話者ファイルの読み込み(`Engine::new` は対応済み。UI の入口がない)、骨格エディタの値をエンジンに反映(§c)、`Assembler` のメモリ(WAV を全部保持。1307 モーラのような長い行では要注意)、リスト形式からの自動判別。
+
 画面(サイドバーの「準備中」を埋める):
-1. **子音エディタ**(③): 子音を選び、/a/ /i/ /u/ の 3 基準形状を表示・編集、後続母音に応じた補間結果のプレビュー、口蓋化(き・け・拗音)の**手動上書きの保存/解除**、JSON の入出力。
+1. **子音エディタ**(③): 子音を選び、/a/ /i/ /u/ の 3 基準形状を表示・編集、後続母音に応じた補間結果のプレビュー、口蓋化(き・け・拗音)の**手動上書きの保存/解除**、JSON の入出力。Wasm には `ConsonantEditor` の取得・上書きの API がまだ無い。
 2. **スクラブ・プレビュー**(④): 矢状断面(`GeometryFrame`: `tongue` 正中線、`upper`、`lower`、`contact`)のコマ送り、最小断面積グラフ・声門開口度(`glottal_area_cm2` / `glottal_amplitude_cm`)グラフ・舌口蓋接触のハイライト。
-3. **書き出し**(⑤): リスト入力 → Worker プールで並列生成(進捗表示)→ ZIP ダウンロード。
 UI は §2 の方針に従うこと。
 
 ### c. 骨格エディタを調音モデルに繋ぐ

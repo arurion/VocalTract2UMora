@@ -3,6 +3,7 @@ import "./style.css";
 import init, { version } from "./wasm-pkg/vt2umora_wasm.js";
 import { detectCapabilities } from "./capabilities";
 import type { View } from "./controls";
+import { createExportView } from "./export-view";
 import { createGeometryView } from "./geometry-view";
 import { createVoiceView } from "./voice-view";
 
@@ -20,7 +21,7 @@ const NAV: { id: string; label: string; ready: boolean }[] = [
   { id: "geometry", label: "骨格", ready: true },
   { id: "consonant", label: "子音", ready: false },
   { id: "scrub", label: "スクラブ", ready: false },
-  { id: "export", label: "書き出し", ready: false },
+  { id: "export", label: "書き出し", ready: true },
 ];
 
 const views = new Map<string, View>();
@@ -72,7 +73,7 @@ function buildNav() {
 
 async function main() {
   await init();
-  for (const v of [createVoiceView(schedule), createGeometryView(schedule)]) views.set(v.id, v);
+  for (const v of [createVoiceView(schedule), createGeometryView(schedule), createExportView()]) views.set(v.id, v);
   buildNav();
 
   $("menu").addEventListener("click", () => setDrawer(!$("sidebar").classList.contains("is-open")));
