@@ -37,11 +37,13 @@ pub struct BatchOptions {
     /// Target RMS of the steady vowel (full scale = 1), so that all files have the same level.
     pub target_vowel_rms: f64,
     pub noise_seed: u64,
+    /// Geometry step of the renderer (see `RenderOptions::geometry_stride`).
+    pub geometry_stride: usize,
 }
 
 impl Default for BatchOptions {
     fn default() -> Self {
-        BatchOptions { style: OtoStyle::Single, mora: MoraOptions::default(), sample_rate: 44100.0, target_vowel_rms: 0.10, noise_seed: 1 }
+        BatchOptions { style: OtoStyle::Single, mora: MoraOptions::default(), sample_rate: 44100.0, target_vowel_rms: 0.10, noise_seed: 1, geometry_stride: 2 }
     }
 }
 
@@ -120,7 +122,7 @@ pub fn render_line(sp: &Speaker, editor: &ConsonantEditor, index: usize, morae: 
     }
     if items.is_empty() { return Err("モーラがありません".to_string()); }
     let (score, slots, total) = build_sequence(&items, &opts.mora);
-    let ropts = RenderOptions { sample_rate: opts.sample_rate, noise_seed: opts.noise_seed + index as u64, ..RenderOptions::default() };
+    let ropts = RenderOptions { sample_rate: opts.sample_rate, noise_seed: opts.noise_seed + index as u64, geometry_stride: opts.geometry_stride, ..RenderOptions::default() };
     let r = render_score(sp, editor, &score, &ropts);
 
     // Level: the mean steady-vowel RMS of the line is brought to the target.
@@ -471,6 +473,29 @@ mod tests {
         let rep = build_voicebank(&sp, &ed, "_あか\n_かあ\n", &vcv, "テスト").unwrap();
         // - あ, あ か, - か, か あ
         assert_eq!((rep.entries, rep.files), (4, 2));
+    }
+
+    #[test]
+    fn a_coarser_geometry_step_keeps_the_oto_and_the_level() {
+        let sp = Speaker::from_xml(JD3).unwrap();
+        let ed = ConsonantEditor::from_speaker(&sp).unwrap();
+        let line = split_morae("かさたなはまらが").unwrap();
+        let mut results = vec![];
+        for stride in [1usize, 2, 4] {
+            let o = BatchOptions { style: OtoStyle::Vcv, geometry_stride: stride, ..BatchOptions::default() };
+            let t0 = std::time::Instant::now();
+            let r = render_line(&sp, &ed, 0, &line, &o).unwrap();
+            println!("stride {stride}: {:.2} s", t0.elapsed().as_secs_f64());
+            results.push(r);
+        }
+        let worst = |a: &LineResult, b: &LineResult| {
+            assert_eq!(a.entries.len(), b.entries.len());
+            a.entries.iter().zip(&b.entries).flat_map(|(x, y)| [(x.offset - y.offset).abs(), (x.preutterance - y.preutterance).abs(), (x.overlap - y.overlap).abs(), (x.consonant - y.consonant).abs()]).fold(0.0f64, f64::max)
+        };
+        let (d2, d4) = (worst(&results[0], &results[1]), worst(&results[0], &results[2]));
+        println!("largest oto difference: stride 2 {d2:.1} ms, stride 4 {d4:.1} ms");
+        assert!(d2 < 12.0, "stride 2 moves an oto value by {d2} ms");
+        assert!(d4 < 25.0, "stride 4 moves an oto value by {d4} ms");
     }
 
     #[test]
